@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Claude local
+.claude/
+
+# venv
+.venv/
+
+# Pretrained / downloaded weights (~45MB)
+checkpoints/*.pth
+
+# Inference / session logs
+logs/
+
+# Editor
+.vscode/
+.idea/
+*.swp
