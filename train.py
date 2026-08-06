@@ -38,6 +38,11 @@ from dataset import EpisodicDataset, SAM2EpisodicDataset, get_norm_stats
 from policy import ACTPolicy, ACTSAM2Policy, ACTSAM2CVAEPolicy
 
 
+# Tensorboard
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -212,6 +217,13 @@ def train(
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad()
+            # ------- every N batch record once -----
+            global_step = epoch * len(train_loader) + idx
+
+            if idx % 20 == 0:
+                writer.add_scalar("Loss/train", fwd['loss'].item(), global_step)
+                writer.add_scalar("LR", optimizer.param_groups[0]['lr'], global_step)
+
             batch_dicts.append({k: v.detach() for k, v in fwd.items()})
         if scheduler is not None:
             scheduler.step()
