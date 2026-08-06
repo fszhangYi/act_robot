@@ -221,6 +221,10 @@ def train(
             train_summary['lr'] = scheduler.get_last_lr()[0]
         train_history.append(train_summary)
 
+        # Save training curves
+        with open(os.path.join(ckpt_dir, 'training_history.json'), 'w') as f:
+            json.dump({'train': train_history, 'val': val_history}, f)
+
         if (epoch + 1) % 100 == 0 or epoch == start_epoch:
             print(f'epoch {epoch+1:4d}/{num_epochs}  '
                   f'train={train_summary["loss"]:.4f}  '
@@ -235,10 +239,6 @@ def train(
     # ---- end of training ----
     torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
     save_optimizer(ckpt_dir, num_epochs, optimizer, scheduler)
-
-    # Save training curves
-    with open(os.path.join(ckpt_dir, 'train_history.json'), 'w') as f:
-        json.dump({'train': train_history, 'val': val_history}, f)
 
     print(f'\nTraining done.  best_val={min_val_loss:.6f}')
     print(f'Best checkpoint: {os.path.join(ckpt_dir, "policy_best.ckpt")}')
