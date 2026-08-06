@@ -24,6 +24,7 @@ import pickle
 import sys
 from copy import deepcopy
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -200,7 +201,11 @@ def train(
         policy.train()
         optimizer.zero_grad()
         batch_dicts: list[dict] = []
-        for batch in train_loader:
+        t0 = time.time()
+        for idx, batch in enumerate(train_loader):
+            t_data = time.time()
+            print(f"Epoch {idx}: Data loading took {t_data-t0:.3f}s")
+            t0 = time.time()
             fwd = forward_pass(batch, policy)
             fwd['loss'].backward()
             if grad_clip > 0:
