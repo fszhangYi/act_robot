@@ -24,6 +24,7 @@ import pickle
 import sys
 from copy import deepcopy
 from pathlib import Path
+import subprocess
 import time
 
 import numpy as np
@@ -46,6 +47,7 @@ writer = SummaryWriter()
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+
 
 def forward_pass(batch, policy):
     # First batch tensor is either image_data (ACTPolicy) or sam2_feat (ACTSAM2Policy).
@@ -77,6 +79,22 @@ def save_optimizer(ckpt_dir, completed_epoch, optimizer, scheduler=None):
     torch.save(data, os.path.join(ckpt_dir, 'optimizer.pt'))
 
 
+def _read_gpu_smi() -> dict[str, float]:
+    """Query nvidia-smi for GPU 0 metrics. Returns empty dict on failure."""
+    try:
+        out = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=power.draw,temperature.gpu,'
+             'utilization.gpu,fan.speed,memory.used',
+             '--format=csv,noheader,nounits'],
+            timeout=5,
+        )
+        parts = out.decode().strip().split(',')
+        keys = ['power_w', 'temp_c', 'util_pct', 'fan_pct', 'mem_used_mb']
+        return {k: float(p.strip()) for k, p in zip(keys, parts)}
+    except Exception:
+        return {}
+
+
 def train(
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -102,8 +120,6 @@ def train(
 
     if resume_from is not None:
         resume_dir = str(Path(resume_from).parent)
-
-        # (a) Load model weights
         print(f'Loading model weights from: {resume_from}')
         state_dict = torch.load(resume_from, map_location='cpu')
         policy.load_state_dict(state_dict)
@@ -139,7 +155,6 @@ def train(
                     print(f'Training history loaded: {len(train_history)} epochs')
             except Exception as e:
                 print(f'WARNING: Could not load train_history.json: {e}')
-
         # (d) Restore best model
         best_path = os.path.join(resume_dir, 'policy_best.ckpt')
         if os.path.exists(best_path):
@@ -173,6 +188,7 @@ def train(
         if start_epoch > 0:
             print(f'CosineAnnealingLR advanced to epoch {start_epoch} '
                   f'(T_max={num_epochs}, current LR={scheduler.get_last_lr()[0]:.2e})')
+
 
     # ------------------------------------------------------------------
     # Guard: already finished?
@@ -223,7 +239,14 @@ def train(
             if idx % 20 == 0:
                 writer.add_scalar("Loss/train", fwd['loss'].item(), global_step)
                 writer.add_scalar("LR", optimizer.param_groups[0]['lr'], global_step)
-
+                gpu = _read_gpu_smi()
+                if gpu:
+                    writer.add_scalar('GPU/power_w',      gpu['power_w'],      global_step)
+                    writer.add_scalar('GPU/temp_c',        gpu['temp_c'],        global_step)
+                    writer.add_scalar('GPU/util_pct',      gpu['util_pct'],      global_step)
+                    writer.add_scalar('GPU/fan_pct',       gpu['fan_pct'],       global_step)
+                    writer.add_scalar('GPU/mem_used_mb',   gpu['mem_used_mb'],   global_step)
+            
             batch_dicts.append({k: v.detach() for k, v in fwd.items()})
         if scheduler is not None:
             scheduler.step()
@@ -233,9 +256,14 @@ def train(
             train_summary['lr'] = scheduler.get_last_lr()[0]
         train_history.append(train_summary)
 
-        # Save training curves
+        # Save training curves + last checkpoint every epoch (safe against interrupts)
         with open(os.path.join(ckpt_dir, 'training_history.json'), 'w') as f:
             json.dump({'train': train_history, 'val': val_history}, f)
+        torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
+        save_optimizer(ckpt_dir, epoch + 1, optimizer, scheduler)
+
+        # ---- per-epoch TensorBoard logging ----
+        writer.add_scalar('Loss/val', epoch_val_loss, epoch)
 
         if (epoch + 1) % 100 == 0 or epoch == start_epoch:
             print(f'epoch {epoch+1:4d}/{num_epochs}  '
@@ -249,9 +277,6 @@ def train(
             save_optimizer(ckpt_dir, epoch + 1, optimizer, scheduler)
 
     # ---- end of training ----
-    torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
-    save_optimizer(ckpt_dir, num_epochs, optimizer, scheduler)
-
     print(f'\nTraining done.  best_val={min_val_loss:.6f}')
     print(f'Best checkpoint: {os.path.join(ckpt_dir, "policy_best.ckpt")}')
     print(f'Optimizer state: {os.path.join(ckpt_dir, "optimizer.pt")}')
@@ -290,6 +315,7 @@ def main() -> None:
     parser.add_argument('--action-repr', choices=['absolute', 'delta'], default='absolute',
                         help='SAM2 mode only. `delta` predicts action - qpos[t] (bounded near '
                              'zero by construction); `absolute` predicts the raw target.')
+
     parser.add_argument('--pool-size', type=int, default=0,
                         help='SAM2 mode only. AdaptiveAvgPool the F_t map to (pool x pool) '
                              "before the transformer. 0 = no pooling (use SAM2's native 64x64). "
@@ -311,6 +337,8 @@ def main() -> None:
                         help='Path to a policy checkpoint (e.g. policy_last.ckpt) to resume '
                              'training from.  The optimizer.pt file in the same directory is '
                              'loaded automatically if present.')
+
+
     args = parser.parse_args()
 
     # Early validation: fail fast if the resume checkpoint doesn't exist
@@ -340,6 +368,7 @@ def main() -> None:
     print(f'Dataset: {info["num_total"]} episodes  |  train={len(train_indices)}  val={len(val_indices)}')
     print(f'max_episode_len={max_episode_len}  stride={info.get("stride", 1)}')
 
+
     # Normalization stats from training set only
     print('Computing normalization statistics from training set...')
     norm_stats = get_norm_stats(data_dir, train_indices, chunk_size=args.chunk_size)
@@ -362,7 +391,6 @@ def main() -> None:
     else:
         train_dataset = EpisodicDataset(train_indices, data_dir, camera_names, norm_stats, max_episode_len)
         val_dataset = EpisodicDataset(val_indices, data_dir, camera_names, norm_stats, max_episode_len)
-
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
@@ -428,4 +456,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-    
+
