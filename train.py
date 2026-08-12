@@ -80,19 +80,44 @@ def save_optimizer(ckpt_dir, completed_epoch, optimizer, scheduler=None):
 
 
 def _read_gpu_smi() -> dict[str, float]:
-    """Query nvidia-smi for GPU 0 metrics. Returns empty dict on failure."""
+    """Query nvidia-smi for GPU 0 crash-diagnostic metrics.  Empty on failure."""
     try:
         out = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=power.draw,temperature.gpu,'
-             'utilization.gpu,fan.speed,memory.used',
+            ['nvidia-smi',
+             '--query-gpu=power.draw,temperature.gpu,utilization.gpu,fan.speed,'
+             'memory.used,ecc.errors.corrected.volatile.total,'
+             'ecc.errors.uncorrected.volatile.total,clocks_throttle_reasons.active',
              '--format=csv,noheader,nounits'],
             timeout=5,
         )
         parts = out.decode().strip().split(',')
-        keys = ['power_w', 'temp_c', 'util_pct', 'fan_pct', 'mem_used_mb']
+        keys = ['power_w', 'temp_c', 'util_pct', 'fan_pct', 'mem_used_mb',
+                'ecc_corrected', 'ecc_uncorrected', 'throttle']
         return {k: float(p.strip()) for k, p in zip(keys, parts)}
     except Exception:
         return {}
+
+
+def _read_sys_metrics(ckpt_dir: str) -> dict[str, float]:
+    """CPU memory + disk free (Linux).  Empty on failure."""
+    result: dict[str, float] = {}
+    try:
+        import shutil
+        usage = shutil.disk_usage(ckpt_dir)
+        result['disk_free_gb'] = usage.free / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        with open('/proc/meminfo') as f:
+            lines = f.read()
+        for line in lines.splitlines():
+            if line.startswith('MemAvailable:'):
+                kb = int(line.split()[1])
+                result['ram_avail_gb'] = kb / (1024 * 1024)
+                break
+    except Exception:
+        pass
+    return result
 
 
 def train(
@@ -241,11 +266,14 @@ def train(
                 writer.add_scalar("LR", optimizer.param_groups[0]['lr'], global_step)
                 gpu = _read_gpu_smi()
                 if gpu:
-                    writer.add_scalar('GPU/power_w',      gpu['power_w'],      global_step)
-                    writer.add_scalar('GPU/temp_c',        gpu['temp_c'],        global_step)
-                    writer.add_scalar('GPU/util_pct',      gpu['util_pct'],      global_step)
-                    writer.add_scalar('GPU/fan_pct',       gpu['fan_pct'],       global_step)
-                    writer.add_scalar('GPU/mem_used_mb',   gpu['mem_used_mb'],   global_step)
+                    writer.add_scalar('GPU/power_w',        gpu['power_w'],        global_step)
+                    writer.add_scalar('GPU/temp_c',          gpu['temp_c'],          global_step)
+                    writer.add_scalar('GPU/util_pct',        gpu['util_pct'],        global_step)
+                    writer.add_scalar('GPU/fan_pct',         gpu['fan_pct'],         global_step)
+                    writer.add_scalar('GPU/mem_used_gb',     gpu['mem_used_mb'] / 1024, global_step)
+                    writer.add_scalar('GPU/ecc_corrected',   gpu['ecc_corrected'],   global_step)
+                    writer.add_scalar('GPU/ecc_uncorrected', gpu['ecc_uncorrected'], global_step)
+                    writer.add_scalar('GPU/throttle',        gpu['throttle'],        global_step)
             
             batch_dicts.append({k: v.detach() for k, v in fwd.items()})
         if scheduler is not None:
@@ -264,6 +292,10 @@ def train(
 
         # ---- per-epoch TensorBoard logging ----
         writer.add_scalar('Loss/val', epoch_val_loss, epoch)
+        sys_metrics = _read_sys_metrics(ckpt_dir)
+        if sys_metrics:
+            for k, v in sys_metrics.items():
+                writer.add_scalar(f'System/{k}', v, epoch)
 
         if (epoch + 1) % 100 == 0 or epoch == start_epoch:
             print(f'epoch {epoch+1:4d}/{num_epochs}  '
@@ -456,4 +488,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
+    
