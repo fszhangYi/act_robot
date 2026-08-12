@@ -126,6 +126,27 @@ def _read_sys_metrics(ckpt_dir: str) -> dict[str, float]:
         pass
     return result
 
+class TrainerCallback:
+    def on_epoch_end(self, epoch, val_loss, best_loss, model, **kwargs):
+        pass
+
+class EarlyStoppingCallback(TrainerCallback):
+    def __init__(self, patience=5, threshold=0.002):
+        self.patience = patience
+        self.threshold = threshold
+        self.counter = 0
+        self.stop_training = False
+    
+    def on_epoch_end(self, epoch, val_loss, best_loss, model, **kwargs):
+        print(f"ES: epoch {epoch + 1}, counter: {self.counter}")
+        if val_loss < best_loss - self.threshold:
+            self.counter = 0
+        else:
+            self.counter+=1
+            if self.counter >= self.patience:
+                self.stop_training = True
+                print(f"Early stopping at epoch {epoch + 1}")
+
 
 def train(
     train_loader: DataLoader,
@@ -139,7 +160,10 @@ def train(
     use_cosine: bool = False,
     min_lr: float = 1e-6,
     resume_from: str | None = None,
+    callbacks:list[TrainerCallback]=None,
 ) -> None:
+    if callbacks is None:
+        callbacks = []
     optimizer = policy.configure_optimizers()
 
     # ------------------------------------------------------------------
@@ -250,6 +274,16 @@ def train(
             min_val_loss = epoch_val_loss
             best_state_dict = deepcopy(policy.state_dict())
             torch.save(best_state_dict, os.path.join(ckpt_dir, 'policy_best.ckpt'))
+
+        # ---- callbacks ----
+        stop = False
+        for cb in callbacks:
+            cb.on_epoch_end(epoch, epoch_val_loss, min_val_loss, policy)
+            if getattr(cb, 'stop_training', False):
+                stop = True
+
+        if stop:
+            break
 
         # ---- training ----
         policy.train()
@@ -489,10 +523,13 @@ def main() -> None:
 
     policy.cuda()
 
+    early_stop = EarlyStoppingCallback(patience=5, threshold=0.002)
+
     train(train_loader, val_loader, policy, args.num_epochs, ckpt_dir, args.seed,
           writer,
           grad_clip=args.grad_clip, use_cosine=args.cosine_lr, min_lr=args.min_lr,
-          resume_from=args.resume_from)
+          resume_from=args.resume_from,
+          callbacks=[early_stop])
     writer.close()
 
 
