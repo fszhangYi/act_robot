@@ -39,10 +39,8 @@ from dataset import EpisodicDataset, SAM2EpisodicDataset, get_norm_stats
 from policy import ACTPolicy, ACTSAM2Policy, ACTSAM2CVAEPolicy
 
 
-# Tensorboard
+# TensorBoard — writer is created in main() so logs land in ckpt_dir/runs/
 from torch.utils.tensorboard import SummaryWriter
-
-writer = SummaryWriter()
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -80,19 +78,17 @@ def save_optimizer(ckpt_dir, completed_epoch, optimizer, scheduler=None):
 
 
 def _read_gpu_smi() -> dict[str, float]:
-    """Query nvidia-smi for GPU 0 crash-diagnostic metrics.  Empty on failure."""
+    """Query nvidia-smi for basic GPU metrics.  Prints error once on first failure."""
     try:
         out = subprocess.check_output(
             ['nvidia-smi',
-             '--query-gpu=power.draw,temperature.gpu,utilization.gpu,fan.speed,'
-             'memory.used,ecc.errors.corrected.volatile.total,'
-             'ecc.errors.uncorrected.volatile.total,clocks_throttle_reasons.active',
-             '--format=csv,noheader,nounits'],
+             '--query-gpu=power.draw,temperature.gpu,utilization.gpu,'
+             'fan.speed,memory.used',
+             '--format=csv,noheader,nounits', '-i', '0'],
             timeout=5,
         )
         parts = out.decode().strip().split(',')
-        keys = ['power_w', 'temp_c', 'util_pct', 'fan_pct', 'mem_used_mb',
-                'ecc_corrected', 'ecc_uncorrected', 'throttle']
+        keys = ['power_w', 'temp_c', 'util_pct', 'fan_pct', 'mem_used_mb']
         values = []
         for p in parts:
             p = p.strip()
@@ -101,7 +97,11 @@ def _read_gpu_smi() -> dict[str, float]:
             else:
                 values.append(float(p))
         return dict(zip(keys, values))
-    except Exception:
+    except Exception as e:
+        _read_gpu_smi._failed = getattr(_read_gpu_smi, '_failed', False)
+        if not _read_gpu_smi._failed:
+            _read_gpu_smi._failed = True
+            print(f'[WARN] GPU monitoring unavailable: {e}')
         return {}
 
 
@@ -134,6 +134,7 @@ def train(
     num_epochs: int,
     ckpt_dir: str,
     seed: int,
+    writer: SummaryWriter,
     grad_clip: float = 0.0,
     use_cosine: bool = False,
     min_lr: float = 1e-6,
@@ -294,17 +295,12 @@ def train(
         torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
         save_optimizer(ckpt_dir, epoch + 1, optimizer, scheduler)
 
-        # ---- per-epoch TensorBoard logging (slow-changing metrics) ----
-        writer.add_scalar('Loss/val', epoch_val_loss, epoch)
-        gpu = _read_gpu_smi()
-        if gpu:
-            writer.add_scalar('GPU/ecc_corrected',   gpu['ecc_corrected'],   epoch)
-            writer.add_scalar('GPU/ecc_uncorrected', gpu['ecc_uncorrected'], epoch)
-            writer.add_scalar('GPU/throttle',        gpu['throttle'],        epoch)
+        # ---- per-epoch TensorBoard logging (use last global_step for alignment) ----
+        writer.add_scalar('Loss/val', epoch_val_loss, global_step)
         sys_metrics = _read_sys_metrics(ckpt_dir)
         if sys_metrics:
             for k, v in sys_metrics.items():
-                writer.add_scalar(f'System/{k}', v, epoch)
+                writer.add_scalar(f'System/{k}', v, global_step)
 
         if (epoch + 1) % 100 == 0 or epoch == start_epoch:
             print(f'epoch {epoch+1:4d}/{num_epochs}  '
@@ -394,6 +390,9 @@ def main() -> None:
     data_dir = args.data_dir
     ckpt_dir = args.ckpt_dir
     os.makedirs(ckpt_dir, exist_ok=True)
+
+    # TensorBoard writer — logs go into ckpt_dir/runs/
+    writer = SummaryWriter(log_dir=os.path.join(ckpt_dir, 'runs'))
 
     # Load dataset split info
     info_path = os.path.join(data_dir, 'dataset_info.json')
@@ -491,8 +490,10 @@ def main() -> None:
     policy.cuda()
 
     train(train_loader, val_loader, policy, args.num_epochs, ckpt_dir, args.seed,
+          writer,
           grad_clip=args.grad_clip, use_cosine=args.cosine_lr, min_lr=args.min_lr,
           resume_from=args.resume_from)
+    writer.close()
 
 
 if __name__ == '__main__':
