@@ -93,7 +93,14 @@ def _read_gpu_smi() -> dict[str, float]:
         parts = out.decode().strip().split(',')
         keys = ['power_w', 'temp_c', 'util_pct', 'fan_pct', 'mem_used_mb',
                 'ecc_corrected', 'ecc_uncorrected', 'throttle']
-        return {k: float(p.strip()) for k, p in zip(keys, parts)}
+        values = []
+        for p in parts:
+            p = p.strip()
+            if p in ('[N/A]', 'N/A', '[Not Supported]', ''):
+                values.append(0.0)
+            else:
+                values.append(float(p))
+        return dict(zip(keys, values))
     except Exception:
         return {}
 
@@ -250,7 +257,7 @@ def train(
         t0 = time.time()
         for idx, batch in enumerate(train_loader):
             t_data = time.time()
-            print(f"Epoch {idx}: Data loading took {t_data-t0:.3f}s")
+            print(f"Batch {idx}: Data loading took {t_data-t0:.3f}s")
             t0 = time.time()
             fwd = forward_pass(batch, policy)
             fwd['loss'].backward()
@@ -271,9 +278,6 @@ def train(
                     writer.add_scalar('GPU/util_pct',        gpu['util_pct'],        global_step)
                     writer.add_scalar('GPU/fan_pct',         gpu['fan_pct'],         global_step)
                     writer.add_scalar('GPU/mem_used_gb',     gpu['mem_used_mb'] / 1024, global_step)
-                    writer.add_scalar('GPU/ecc_corrected',   gpu['ecc_corrected'],   global_step)
-                    writer.add_scalar('GPU/ecc_uncorrected', gpu['ecc_uncorrected'], global_step)
-                    writer.add_scalar('GPU/throttle',        gpu['throttle'],        global_step)
             
             batch_dicts.append({k: v.detach() for k, v in fwd.items()})
         if scheduler is not None:
@@ -285,13 +289,18 @@ def train(
         train_history.append(train_summary)
 
         # Save training curves + last checkpoint every epoch (safe against interrupts)
-        with open(os.path.join(ckpt_dir, 'training_history.json'), 'w') as f:
+        with open(os.path.join(ckpt_dir, 'train_history.json'), 'w') as f:
             json.dump({'train': train_history, 'val': val_history}, f)
         torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
         save_optimizer(ckpt_dir, epoch + 1, optimizer, scheduler)
 
-        # ---- per-epoch TensorBoard logging ----
+        # ---- per-epoch TensorBoard logging (slow-changing metrics) ----
         writer.add_scalar('Loss/val', epoch_val_loss, epoch)
+        gpu = _read_gpu_smi()
+        if gpu:
+            writer.add_scalar('GPU/ecc_corrected',   gpu['ecc_corrected'],   epoch)
+            writer.add_scalar('GPU/ecc_uncorrected', gpu['ecc_uncorrected'], epoch)
+            writer.add_scalar('GPU/throttle',        gpu['throttle'],        epoch)
         sys_metrics = _read_sys_metrics(ckpt_dir)
         if sys_metrics:
             for k, v in sys_metrics.items():
