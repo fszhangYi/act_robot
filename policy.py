@@ -33,6 +33,17 @@ class ACTPolicy(nn.Module):
             loss_dict['l1'] = l1
             loss_dict['kl'] = total_kld[0]
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
+
+            # ----- Add Token Calculation -----
+            B = image.shape[0]
+            # ResNet18 / 32
+            H_feat = image.shape[-2] // 32
+            W_feat = image.shape[-1] // 32
+            num_visual_tokens = H_feat * W_feat
+            num_action_tokens = self.model.num_queries
+            loss_dict['num_tokens'] = B * (num_action_tokens + num_visual_tokens)
+            # Token Calculation End
+
             return loss_dict
         else:  # inference
             a_hat, _, (_, _) = self.model(qpos, image, env_state)

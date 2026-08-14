@@ -55,7 +55,9 @@ def forward_pass(batch, policy):
     qpos_data = qpos_data.cuda(non_blocking=True)
     action_data = action_data.cuda(non_blocking=True)
     is_pad = is_pad.cuda(non_blocking=True)
-    return policy(qpos_data, visual_data, action_data, is_pad)
+
+    output = policy(qpos_data, visual_data, action_data, is_pad)
+    return output
 
 
 def save_optimizer(ckpt_dir, completed_epoch, optimizer, scheduler=None):
@@ -266,8 +268,8 @@ def train(
         policy.eval()
         with torch.inference_mode():
             epoch_dicts = [forward_pass(b, policy) for b in val_loader]
-        val_summary = {k: torch.stack([d[k] for d in epoch_dicts]).mean().item()
-                       for k in epoch_dicts[0]}
+        val_summary = {k: torch.stack([d[k] for d in epoch_dicts if d != 'num_tokens']).mean().item()
+                       for k in epoch_dicts[0] if k != 'num_tokens'}
         val_history.append(val_summary)
         epoch_val_loss = val_summary['loss']
         if epoch_val_loss < min_val_loss:
@@ -289,6 +291,13 @@ def train(
         policy.train()
         optimizer.zero_grad()
         batch_dicts: list[dict] = []
+        # Calculate I/O
+        log_every_n_batch = 20
+        tokens_since_log = 0
+        batch_start_time = time.perf_counter()
+        epoch_start_time = time.perf_counter()
+
+        # end I/O calculation
         t0 = time.time()
         for idx, batch in enumerate(train_loader):
             t_data = time.time()
@@ -300,10 +309,29 @@ def train(
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad()
+            # detach and save
+            # batch_dicts.append({k: v.detach() for k, v in fwd.items()})
+            batch_dicts.append({k: v.detach() for k, v in fwd.items() if k != 'num_tokens'})
             # ------- every N batch record once -----
-            global_step = epoch * len(train_loader) + idx
 
-            if idx % 20 == 0:
+            tokens_in_batch = fwd.get("num_tokens", None)
+            
+            if tokens_in_batch is None:
+                # fallback
+                tokens_in_batch =  batch[0].shape[0] * policy.model.num_queries
+
+            tokens_since_log += tokens_in_batch
+
+            if (idx+1) % log_every_n_batch == 0:
+                elapsed = time.perf_counter() - batch_start_time
+                print(f"elapsed: {elapsed}, batch_start_time: {batch_start_time}")
+                tokens_per_sec = tokens_since_log / elapsed if elapsed > 0 else 0.0
+                global_step = epoch * len(train_loader) + idx
+                writer.add_scalar('throughput/token_per_sec', tokens_per_sec, global_step)
+                writer.add_scalar('throughput/sample_per_sec', (log_every_n_batch*batch[0].shape[0])/elapsed, global_step)
+                tokens_since_log = 0
+                batch_start_time = time.perf_counter()
+                
                 writer.add_scalar("Loss/train", fwd['loss'].item(), global_step)
                 writer.add_scalar("LR", optimizer.param_groups[0]['lr'], global_step)
                 gpu = _read_gpu_smi()
@@ -314,7 +342,6 @@ def train(
                     writer.add_scalar('GPU/fan_pct',         gpu['fan_pct'],         global_step)
                     writer.add_scalar('GPU/mem_used_gb',     gpu['mem_used_mb'] / 1024, global_step)
             
-            batch_dicts.append({k: v.detach() for k, v in fwd.items()})
         if scheduler is not None:
             scheduler.step()
         train_summary = {k: torch.stack([d[k] for d in batch_dicts]).mean().item()
