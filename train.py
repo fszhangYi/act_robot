@@ -133,21 +133,33 @@ class TrainerCallback:
         pass
 
 class EarlyStoppingCallback(TrainerCallback):
-    def __init__(self, patience=5, threshold=0.002):
+    """根据验证 loss 早停。
+
+    在 callback 内部自行维护 best_loss，避免调用方先把 min_val_loss
+    更新成当前 val_loss 后再传入，导致 `val < best - threshold` 几乎永假、
+    counter 永不复位、大约 patience 个 epoch 后必定停训的问题。
+    """
+
+    def __init__(self, patience=100, threshold=0.002):
         self.patience = patience
         self.threshold = threshold
         self.counter = 0
+        self.best_loss = float('inf')
         self.stop_training = False
-    
-    def on_epoch_end(self, epoch, val_loss, best_loss, model, **kwargs):
-        print(f"ES: epoch {epoch + 1}, counter: {self.counter}")
-        if val_loss < best_loss - self.threshold:
+
+    def on_epoch_end(self, epoch, val_loss, best_loss=None, model=None, **kwargs):
+        # best_loss 参数保留以兼容接口，实际以 self.best_loss 为准
+        print(f'ES: epoch {epoch + 1}, val={val_loss:.6f}, '
+              f'best={self.best_loss:.6f}, counter={self.counter}')
+        if val_loss < self.best_loss - self.threshold:
+            self.best_loss = val_loss
             self.counter = 0
         else:
-            self.counter+=1
+            self.counter += 1
             if self.counter >= self.patience:
                 self.stop_training = True
-                print(f"Early stopping at epoch {epoch + 1}")
+                print(f'Early stopping at epoch {epoch + 1} '
+                      f'(patience={self.patience}, best_val={self.best_loss:.6f})')
 
 
 def train(
@@ -263,8 +275,64 @@ def train(
 
     print(f'Training epochs {start_epoch + 1} → {num_epochs}')
 
+    # 从 resume 恢复的 best_val 同步到 early-stop，避免把历史最优当成「未改进」
+    for cb in callbacks:
+        if isinstance(cb, EarlyStoppingCallback) and min_val_loss < float('inf'):
+            cb.best_loss = min_val_loss
+
     for epoch in tqdm(range(start_epoch, num_epochs)):
-        # ---- validation ----
+        # ---- training（先训再 val，避免「val → 可能停 → 本轮根本不训」）----
+        policy.train()
+        optimizer.zero_grad()
+        batch_dicts: list[dict] = []
+        log_every_n_batch = 20
+        tokens_since_log = 0
+        batch_start_time = time.perf_counter()
+        global_step = epoch * len(train_loader)
+
+        for idx, batch in enumerate(train_loader):
+            fwd = forward_pass(batch, policy)
+            fwd['loss'].backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
+            batch_dicts.append({k: v.detach() for k, v in fwd.items() if k != 'num_tokens'})
+
+            tokens_in_batch = fwd.get('num_tokens', None)
+            if tokens_in_batch is None:
+                tokens_in_batch = batch[0].shape[0] * policy.model.num_queries
+            tokens_since_log += tokens_in_batch
+
+            if (idx + 1) % log_every_n_batch == 0:
+                elapsed = time.perf_counter() - batch_start_time
+                tokens_per_sec = tokens_since_log / elapsed if elapsed > 0 else 0.0
+                global_step = epoch * len(train_loader) + idx
+                writer.add_scalar('throughput/token_per_sec', tokens_per_sec, global_step)
+                writer.add_scalar('throughput/sample_per_sec',
+                                 (log_every_n_batch * batch[0].shape[0]) / elapsed, global_step)
+                tokens_since_log = 0
+                batch_start_time = time.perf_counter()
+
+                writer.add_scalar('Loss/train', fwd['loss'].item(), global_step)
+                writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
+                gpu = _read_gpu_smi()
+                if gpu:
+                    writer.add_scalar('GPU/power_w', gpu['power_w'], global_step)
+                    writer.add_scalar('GPU/temp_c', gpu['temp_c'], global_step)
+                    writer.add_scalar('GPU/util_pct', gpu['util_pct'], global_step)
+                    writer.add_scalar('GPU/fan_pct', gpu['fan_pct'], global_step)
+                    writer.add_scalar('GPU/mem_used_gb', gpu['mem_used_mb'] / 1024, global_step)
+
+        if scheduler is not None:
+            scheduler.step()
+        train_summary = {k: torch.stack([d[k] for d in batch_dicts]).mean().item()
+                         for k in batch_dicts[0]}
+        if scheduler is not None:
+            train_summary['lr'] = scheduler.get_last_lr()[0]
+        train_history.append(train_summary)
+
+        # ---- validation（对本轮刚更新的权重评估）----
         policy.eval()
         with torch.inference_mode():
             epoch_dicts = [forward_pass(b, policy) for b in val_loader]
@@ -277,86 +345,19 @@ def train(
             best_state_dict = deepcopy(policy.state_dict())
             torch.save(best_state_dict, os.path.join(ckpt_dir, 'policy_best.ckpt'))
 
-        # ---- callbacks ----
+        # ---- callbacks / early stopping（在本轮 train+val 之后决定是否停）----
         stop = False
         for cb in callbacks:
             cb.on_epoch_end(epoch, epoch_val_loss, min_val_loss, policy)
             if getattr(cb, 'stop_training', False):
                 stop = True
 
-        if stop:
-            break
-
-        # ---- training ----
-        policy.train()
-        optimizer.zero_grad()
-        batch_dicts: list[dict] = []
-        # Calculate I/O
-        log_every_n_batch = 20
-        tokens_since_log = 0
-        batch_start_time = time.perf_counter()
-        epoch_start_time = time.perf_counter()
-
-        # end I/O calculation
-        t0 = time.time()
-        for idx, batch in enumerate(train_loader):
-            t_data = time.time()
-            print(f"Batch {idx}: Data loading took {t_data-t0:.3f}s")
-            t0 = time.time()
-            fwd = forward_pass(batch, policy)
-            fwd['loss'].backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=grad_clip)
-            optimizer.step()
-            optimizer.zero_grad()
-            # detach and save
-            # batch_dicts.append({k: v.detach() for k, v in fwd.items()})
-            batch_dicts.append({k: v.detach() for k, v in fwd.items() if k != 'num_tokens'})
-            # ------- every N batch record once -----
-
-            tokens_in_batch = fwd.get("num_tokens", None)
-            
-            if tokens_in_batch is None:
-                # fallback
-                tokens_in_batch =  batch[0].shape[0] * policy.model.num_queries
-
-            tokens_since_log += tokens_in_batch
-
-            if (idx+1) % log_every_n_batch == 0:
-                elapsed = time.perf_counter() - batch_start_time
-                print(f"elapsed: {elapsed}, batch_start_time: {batch_start_time}")
-                tokens_per_sec = tokens_since_log / elapsed if elapsed > 0 else 0.0
-                global_step = epoch * len(train_loader) + idx
-                writer.add_scalar('throughput/token_per_sec', tokens_per_sec, global_step)
-                writer.add_scalar('throughput/sample_per_sec', (log_every_n_batch*batch[0].shape[0])/elapsed, global_step)
-                tokens_since_log = 0
-                batch_start_time = time.perf_counter()
-                
-                writer.add_scalar("Loss/train", fwd['loss'].item(), global_step)
-                writer.add_scalar("LR", optimizer.param_groups[0]['lr'], global_step)
-                gpu = _read_gpu_smi()
-                if gpu:
-                    writer.add_scalar('GPU/power_w',        gpu['power_w'],        global_step)
-                    writer.add_scalar('GPU/temp_c',          gpu['temp_c'],          global_step)
-                    writer.add_scalar('GPU/util_pct',        gpu['util_pct'],        global_step)
-                    writer.add_scalar('GPU/fan_pct',         gpu['fan_pct'],         global_step)
-                    writer.add_scalar('GPU/mem_used_gb',     gpu['mem_used_mb'] / 1024, global_step)
-            
-        if scheduler is not None:
-            scheduler.step()
-        train_summary = {k: torch.stack([d[k] for d in batch_dicts]).mean().item()
-                         for k in batch_dicts[0]}
-        if scheduler is not None:
-            train_summary['lr'] = scheduler.get_last_lr()[0]
-        train_history.append(train_summary)
-
-        # Save training curves + last checkpoint every epoch (safe against interrupts)
+        # Save training curves + last checkpoint every epoch（停训前也落盘）
         with open(os.path.join(ckpt_dir, 'train_history.json'), 'w') as f:
             json.dump({'train': train_history, 'val': val_history}, f)
         torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
         save_optimizer(ckpt_dir, epoch + 1, optimizer, scheduler)
 
-        # ---- per-epoch TensorBoard logging (use last global_step for alignment) ----
         writer.add_scalar('Loss/val', epoch_val_loss, global_step)
         sys_metrics = _read_sys_metrics(ckpt_dir)
         if sys_metrics:
@@ -373,6 +374,9 @@ def train(
             torch.save(policy.state_dict(),
                        os.path.join(ckpt_dir, f'policy_epoch_{epoch+1}_seed_{seed}.ckpt'))
             save_optimizer(ckpt_dir, epoch + 1, optimizer, scheduler)
+
+        if stop:
+            break
 
     # ---- end of training ----
     print(f'\nTraining done.  best_val={min_val_loss:.6f}')
@@ -435,7 +439,11 @@ def main() -> None:
                         help='Path to a policy checkpoint (e.g. policy_last.ckpt) to resume '
                              'training from.  The optimizer.pt file in the same directory is '
                              'loaded automatically if present.')
-
+    parser.add_argument('--early-stop-patience', type=int, default=100,
+                        help='验证 loss 连续多少个 epoch 无显著下降则停训。'
+                             '0 = 关闭 early stopping。ACT 常需上千 epoch，默认 100。')
+    parser.add_argument('--early-stop-threshold', type=float, default=0.002,
+                        help='判定「有改进」的最小 val loss 降幅（仅 early-stop-patience>0 时生效）')
 
     args = parser.parse_args()
 
@@ -550,13 +558,22 @@ def main() -> None:
 
     policy.cuda()
 
-    early_stop = EarlyStoppingCallback(patience=5, threshold=0.002)
+    callbacks: list[TrainerCallback] = []
+    if args.early_stop_patience > 0:
+        callbacks.append(EarlyStoppingCallback(
+            patience=args.early_stop_patience,
+            threshold=args.early_stop_threshold,
+        ))
+        print(f'Early stopping: patience={args.early_stop_patience}  '
+              f'threshold={args.early_stop_threshold}')
+    else:
+        print('Early stopping: disabled (--early-stop-patience 0)')
 
     train(train_loader, val_loader, policy, args.num_epochs, ckpt_dir, args.seed,
           writer,
           grad_clip=args.grad_clip, use_cosine=args.cosine_lr, min_lr=args.min_lr,
           resume_from=args.resume_from,
-          callbacks=[early_stop])
+          callbacks=callbacks)
     writer.close()
 
 
