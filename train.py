@@ -296,8 +296,13 @@ def train(
         batch_dicts: list[dict] = []
         log_every_n_batch = 20
         tokens_since_log = 0
+        samples_since_log = 0
+        loss_since_log = 0.0
+        n_batches_since_log = 0
         batch_start_time = time.perf_counter()
-        global_step = epoch * len(train_loader)
+        # 本 epoch 起点；循环内更新为当前 batch 的全局 step
+        n_train_batches = len(train_loader)
+        global_step = epoch * n_train_batches
 
         for idx, batch in enumerate(train_loader):
             fwd = forward_pass(batch, policy)
@@ -310,28 +315,40 @@ def train(
 
             tokens_in_batch = fwd.get('num_tokens', None)
             if tokens_in_batch is None:
-                tokens_in_batch = batch[0].shape[0] * policy.model.num_queries
+                # 回退：样本数 × chunk（SAM2 等未回传 num_tokens 时至少保证可算）
+                tokens_in_batch = int(batch[0].shape[0] * policy.model.num_queries)
+            elif torch.is_tensor(tokens_in_batch):
+                tokens_in_batch = int(tokens_in_batch.item())
+            else:
+                tokens_in_batch = int(tokens_in_batch)
+
+            batch_size = int(batch[0].shape[0])
             tokens_since_log += tokens_in_batch
+            samples_since_log += batch_size
+            loss_since_log += float(fwd['loss'].item())
+            n_batches_since_log += 1
+            global_step = epoch * n_train_batches + idx
 
-            if (idx + 1) % log_every_n_batch == 0:
+            # 满窗口或本 epoch 最后一批都落盘，避免短 epoch / 尾部窗口丢失
+            is_log_boundary = ((idx + 1) % log_every_n_batch == 0
+                               or (idx + 1) == n_train_batches)
+            if is_log_boundary and n_batches_since_log > 0:
                 elapsed = time.perf_counter() - batch_start_time
-                tokens_per_sec = tokens_since_log / elapsed if elapsed > 0 else 0.0
-                global_step = epoch * len(train_loader) + idx
-                writer.add_scalar('throughput/token_per_sec', tokens_per_sec, global_step)
-                writer.add_scalar('throughput/sample_per_sec',
-                                 (log_every_n_batch * batch[0].shape[0]) / elapsed, global_step)
-                tokens_since_log = 0
-                batch_start_time = time.perf_counter()
-
-                writer.add_scalar('Loss/train', fwd['loss'].item(), global_step)
+                if elapsed > 0:
+                    writer.add_scalar('throughput/token_per_sec',
+                                     tokens_since_log / elapsed, global_step)
+                    writer.add_scalar('throughput/sample_per_sec',
+                                     samples_since_log / elapsed, global_step)
+                # 窗口内平均 loss，而非只记最后一 batch（原先会高估噪声）
+                writer.add_scalar('Loss/train',
+                                 loss_since_log / n_batches_since_log, global_step)
                 writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
-                gpu = _read_gpu_smi()
-                if gpu:
-                    writer.add_scalar('GPU/power_w', gpu['power_w'], global_step)
-                    writer.add_scalar('GPU/temp_c', gpu['temp_c'], global_step)
-                    writer.add_scalar('GPU/util_pct', gpu['util_pct'], global_step)
-                    writer.add_scalar('GPU/fan_pct', gpu['fan_pct'], global_step)
-                    writer.add_scalar('GPU/mem_used_gb', gpu['mem_used_mb'] / 1024, global_step)
+
+                tokens_since_log = 0
+                samples_since_log = 0
+                loss_since_log = 0.0
+                n_batches_since_log = 0
+                batch_start_time = time.perf_counter()
 
         if scheduler is not None:
             scheduler.step()
@@ -367,7 +384,24 @@ def train(
         torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
         save_optimizer(ckpt_dir, epoch + 1, optimizer, scheduler)
 
+        # epoch 级标量：与本 epoch 最后一个 batch 的 global_step 对齐
+        writer.add_scalar('Loss/train_epoch', train_summary['loss'], global_step)
         writer.add_scalar('Loss/val', epoch_val_loss, global_step)
+        writer.add_scalar('Loss/best_val', min_val_loss, global_step)
+        for key in ('l1', 'kl', 'l2', 'cum_l1'):
+            if key in train_summary:
+                writer.add_scalar(f'Loss/{key}', train_summary[key], global_step)
+            if key in val_summary:
+                writer.add_scalar(f'Loss/val_{key}', val_summary[key], global_step)
+
+        gpu = _read_gpu_smi()
+        if gpu:
+            writer.add_scalar('GPU/power_w', gpu['power_w'], global_step)
+            writer.add_scalar('GPU/temp_c', gpu['temp_c'], global_step)
+            writer.add_scalar('GPU/util_pct', gpu['util_pct'], global_step)
+            writer.add_scalar('GPU/fan_pct', gpu['fan_pct'], global_step)
+            writer.add_scalar('GPU/mem_used_gb', gpu['mem_used_mb'] / 1024, global_step)
+
         sys_metrics = _read_sys_metrics(ckpt_dir)
         if sys_metrics:
             for k, v in sys_metrics.items():
