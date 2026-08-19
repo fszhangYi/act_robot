@@ -1,36 +1,49 @@
 #!/usr/bin/env python3
 """ACT inference server.
 
-Two model modes are supported, chosen by the `use_sam2_features` flag in the
-checkpoint's policy_config.json (set by train.py at training time):
+按 ckpt 同目录 policy_config.json 的 `use_sam2_features` 自动选择线协议
+（启动时会打印 `wire_protocol=...`）。以下为与代码逐字节一致的真相。
 
-  ResNet18 baseline (multi-camera ACT policy) — per-step protocol:
-      28B robot_state  (7 × float32, big-endian)
-      4B  refresh flag (uint32; 1 = reset episode state)
-      4B  num_cams     (uint32; must equal len(policy_config['camera_names']))
-      For each cam in camera_names order:
-          4B  jpeg_len (uint32)
-          N B JPEG bytes
-    Single-camera deployments simply send num_cams=1 + one JPEG.
+────────────────────────────────────────────────────────────────────────────
+baseline_vla（use_sam2_features=False，对接 tonglu / serve_tmp VLA 布局）
+────────────────────────────────────────────────────────────────────────────
+  Client → Server（每帧，big-endian；无 refresh / 无 num_cams；新连接 = 新 episode）:
+      4B  top_len    + top JPEG
+      4B  chest_len  + chest JPEG
+      4B  wrist2_len + wrist2 JPEG   → 映射到 camera_names 中的 "wrist_2"
+      4B  text_len   + text UTF-8    （接收但不用于推理）
+      28B robot_state (7 × float32)
 
-  SAM2Grasp policy (use_sam2_features=True) — LEGACY 100_15 protocol:
+  Server → Client:
+      28B next_state  (7 × float32) = compose_pose(state, action)
+      4B  term_flag   (uint32, 当前恒为 0)
+      4B  reject_flag (uint32, 当前恒为 0)
+      4B  text_len    + UTF-8 文本（当前固定 "success"）
+
+  注意：相机 JPEG 在线上固定顺序为 top → chest → wrist2；再按
+  policy_config['camera_names'] 重排后喂模型。
+
+────────────────────────────────────────────────────────────────────────────
+sam2_legacy（use_sam2_features=True，100_15 旧协议）
+────────────────────────────────────────────────────────────────────────────
+  Client → Server（每帧，big-endian）:
       4B  wrist_image_length (uint32)
       N B wrist JPEG bytes
-      4B  left_image_length  (received but unused)
+      4B  left_image_length  (uint32；接收但不用于推理)
       M B rear-left JPEG bytes
       28B robot_state (7 × float32)
-      4B  refresh flag (uint32)
-      If refresh==1:
-          16B bbox xyxy (4 × float32 in raw wrist pixel coordinates)
-    Internally: serve.py initialises a SAM2 video predictor on the first frame
-    with the bbox prompt, then propagates one frame at a time as further wrist
-    JPEGs arrive. The per-frame F_t feeds the ACTSAM2Policy.
+      4B  refresh flag (uint32；1 = 重置 episode / SAM2 状态)
+      if refresh == 1:
+          16B bbox xyxy (4 × float32，腕部图像素坐标；无 prompt_type 字段)
 
-Server reply (both modes):
-    28B next_state_absolute (7 × float32) = compose_pose(state, action)
+  Server → Client:
+      28B next_state_absolute (7 × float32) = compose_pose(state, action)
+
+  首帧 refresh=1：用 bbox 初始化 SAM2StreamingFeatureExtractor，提取 F_0；
+  后续帧逐帧 streaming 产 F_t，喂 ACTSAM2Policy。
 
 Usage:
-    python act_robot/serve.py \\
+    python serve.py \\
         --checkpoint /path/policy_best.ckpt \\
         --stats      /path/dataset_stats.pkl \\
         --port 5000 \\
@@ -648,6 +661,19 @@ def main() -> None:
                   'always_first': 'always-first (per-step, chunk[0] only)',
                   'chunk_replay': f'chunk-replay (chunk_size={inferencer.chunk_size})'}[mode]
     print(f'Inference mode: {mode_label}')
+
+    # 启动 banner：以代码为唯一真相，避免客户端按过期 README 对不齐字节
+    if inferencer.use_sam2:
+        wire = 'sam2_legacy'
+        layout = ('client: wrist_jpeg + rear_left_jpeg + 28B state + 4B refresh'
+                  ' [+16B bbox if refresh=1]  →  server: 28B next_state')
+    else:
+        wire = 'baseline_vla'
+        layout = ('client: top_jpeg + chest_jpeg + wrist2_jpeg + text + 28B state'
+                  '  →  server: 28B next_state + term + reject + text'
+                  f'  | camera_names={inferencer.camera_names}')
+    print(f'wire_protocol={wire}')
+    print(f'wire_layout: {layout}')
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

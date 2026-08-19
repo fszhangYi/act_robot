@@ -127,22 +127,56 @@ python act_robot/serve.py \
 
 ## 通信协议
 
-客户端每步发送（big-endian）：
+`serve.py` 按 ckpt 的 `policy_config.json` → `use_sam2_features` 自动选协议，启动时打印
+`wire_protocol=baseline_vla|sam2_legacy`。**以代码 / 启动 banner 为准**；金标准客户端见
+`scripts/mock_client_sam2.py`（SAM2）与 `scripts/smoke_infer_tonglu.py`（基线离线冒烟）。
+
+### A. `baseline_vla`（tonglu 多相机 / serve_tmp VLA 布局）
+
+`use_sam2_features=false`。**无 refresh、无 num_cams**；新 TCP 连接 = 新 episode。
+
+Client → Server（每帧，big-endian）：
+
+```
+4B   top_len    + top JPEG
+4B   chest_len  + chest JPEG
+4B   wrist2_len + wrist2 JPEG   → 映射为 camera "wrist_2"
+4B   text_len   + text UTF-8    （接收但不用于推理）
+28B  robot_state (7 × float32: x, y, z, rx, ry, rz, gripper)
+```
+
+Server → Client：
+
+```
+28B  next_state  (7 × float32) = compose_pose(current_state, predicted_action)
+4B   term_flag   (uint32, 当前恒 0)
+4B   reject_flag (uint32, 当前恒 0)
+4B   text_len    + UTF-8（当前固定 "success"）
+```
+
+线上 JPEG 顺序固定为 top → chest → wrist2，再按 `camera_names` 重排后喂模型。
+
+### B. `sam2_legacy`（100_15 SAM2Grasp）
+
+`use_sam2_features=true`。
+
+Client → Server（每帧，big-endian）：
 
 ```
 4B   wrist_image_length (uint32)
 N B  wrist JPEG bytes
-4B   left_image_length  (uint32, 数据接收但不用于推理)
+4B   left_image_length  (uint32, 接收但不用于推理)
 M B  rear-left JPEG bytes
-28B  robot_state (7 × float32: x, y, z, rx, ry, rz, gripper)
-4B   refresh (uint32; 1 = 新 episode 开始，重置状态)
+28B  robot_state (7 × float32)
+4B   refresh (uint32; 1 = 新 episode / 重置 SAM2)
+if refresh == 1:
+    16B  bbox xyxy (4 × float32, wrist 像素坐标)   # 无 prompt_type 字段
 ```
 
-服务器回复：
+Server → Client：
 
 ```
-28B  next_state (7 × float32: x, y, z, rx, ry, rz, gripper)
-     = compose_pose(current_state, predicted_action)
+28B  next_state (7 × float32) = compose_pose(current_state, predicted_action)
 ```
 
 ---
@@ -246,7 +280,7 @@ python scripts/eval_sam2_offline.py \
 
 ### Step 4：起推理服务（serve.py 无需改动）
 
-serve.py 通过读 ckpt 同目录的 `policy_config.json` 的 `use_sam2_features` 字段自动切到 SAM2 路径，加载 `SAM2StreamingFeatureExtractor`。**协议在 refresh=1 时多了 20B prompt** 字段，详见下节。
+serve.py 通过读 ckpt 同目录的 `policy_config.json` 的 `use_sam2_features` 字段自动切到 SAM2 路径，加载 `SAM2StreamingFeatureExtractor`。线协议见上文 [通信协议 §B `sam2_legacy`](#b-sam2_legacy100_15-sam2grasp)；`refresh==1` 时仅多 **16B bbox**（无 `prompt_type`）。
 
 ```bash
 python serve.py \
@@ -255,7 +289,8 @@ python serve.py \
     --port 5000
 ```
 
-启动后日志会打 `mode=SAM2Grasp  chunk_size=10  state_dim=7  action_space=joint`。
+启动后日志会打 `wire_protocol=sam2_legacy` 以及
+`mode=SAM2Grasp  chunk_size=10  state_dim=7  action_space=joint`。
 
 ### Step 5：端到端 mock client 验证
 
@@ -271,19 +306,10 @@ python scripts/mock_client_sam2.py \
 
 ### SAM2Grasp 协议扩展
 
-相对基线 ACT 协议（见 [通信协议](#通信协议)），**只有 `refresh==1` 时多 20 字节 prompt**；`refresh==0` 完全不变。
+相对 100_15 旧布局，**只有 `refresh==1` 时多 16 字节 bbox**；`refresh==0` 完全不变。
+**不要**再发 `prompt_type`：当前实现 refresh=1 后直接读 16B bbox，多发 4B 会把 bbox 读偏。
 
-```
-4B   wrist_image_length
-N B  wrist JPEG bytes
-4B   left_image_length  (received but unused)
-M B  rear-left JPEG bytes
-28B  robot_state (7 × float32)
-4B   refresh (uint32; 1 = 新 episode 开始)
-if refresh == 1:
-    4B   prompt_type (uint32; 0 = bbox; 当前只支持 bbox)
-    16B  bbox xyxy (4 × float32, wrist 图像像素坐标)
-```
+完整字节布局见 [通信协议 §B](#b-sam2_legacy100_15-sam2grasp)。金标准客户端：`scripts/mock_client_sam2.py`。
 
 Server 收到 refresh=1：重置 SAM2 state → 用 bbox `add_new_points_or_box` 在首帧锁定目标 → 提取 F_0 → 喂模型出 chunk。后续帧 SAM2 用 memory attention 自动追踪并产 F_t。
 
@@ -327,12 +353,13 @@ python train.py --data-dir <out> --ckpt-dir <ckpt> \
 python serve.py --checkpoint <ckpt>/policy_best.ckpt --stats <ckpt>/dataset_stats.pkl --port 5000
 ```
 
-新线协议（multi-camera baseline）：
+新线协议（`wire_protocol=baseline_vla`，与 `_handle_baseline_client` 一致）：
 
 ```
-28B robot_state  +  4B refresh  +  4B num_cams
-+ for each cam: 4B jpeg_len + N B JPEG bytes
-→ 28B next_state
+top JPEG + chest JPEG + wrist2 JPEG + text + 28B state
+→ 28B next_state + term + reject + text
 ```
 
-`serve.py` 按 ckpt 的 `policy_config.json` 自动选择基线多相机协议 vs SAM2Grasp 老协议；100_15 SAM2 部署保持兼容，不受本次改动影响。
+无 `refresh` / `num_cams`。详见 [通信协议 §A](#a-baseline_vlatonglu-多相机--serve_tmp-vla-布局) 与 [`docs/tonglu0602.md`](docs/tonglu0602.md)。
+
+`serve.py` 按 ckpt 的 `policy_config.json` 自动选择 `baseline_vla` vs `sam2_legacy`；100_15 SAM2 部署保持兼容。

@@ -208,24 +208,31 @@ server 自动从 `<ckpt_dir>/policy_config.json` 读取：
 - `action_space=cartesian_abs` → next_state 直接是预测值
 - `rx_unwrapped=true` → 自动对 qpos[3] 入端 +2π、next_state[3] 出端 -2π
 
-### 线协议（multi-camera baseline）
+### 线协议（`wire_protocol=baseline_vla`）
+
+与 `serve.py` 的 `_handle_baseline_client` **逐字节一致**（对接 serve_tmp VLA 布局）。
+**无 refresh、无 num_cams**；新 TCP 连接 = 新 episode。启动时会打印 `wire_protocol=baseline_vla`。
 
 **每步 client → server**（big-endian）：
 
 ```
-28B  robot_state   (7 × float32: x, y, z, rx, ry, rz, gripper)
- 4B  refresh       (uint32; 1 = reset 当前 episode 状态)
- 4B  num_cams      (uint32; 必须等于 len(camera_names))
- for cam in camera_names (顺序与 policy_config 一致):
-     4B  jpeg_len  (uint32)
-     N B JPEG bytes
+4B   top_len    + top JPEG
+4B   chest_len  + chest JPEG
+4B   wrist2_len + wrist2 JPEG   → 映射为 camera "wrist_2"
+4B   text_len   + text UTF-8    （接收但不用于推理）
+28B  robot_state (7 × float32: x, y, z, rx, ry, rz, gripper)
 ```
 
 **server → client**：
 
 ```
-28B  next_state    (7 × float32 大端，已应用 compose_pose + rx unwrap 反偏移)
+28B  next_state  (7 × float32 大端，已应用 compose_pose + rx unwrap 反偏移)
+4B   term_flag   (uint32, 当前恒 0)
+4B   reject_flag (uint32, 当前恒 0)
+4B   text_len    + UTF-8（当前固定 "success"）
 ```
+
+线上 JPEG 顺序固定为 top → chest → wrist2，再按 `policy_config['camera_names']` 重排后喂模型。
 
 ### Python client 参考
 
@@ -233,20 +240,30 @@ server 自动从 `<ckpt_dir>/policy_config.json` 读取：
 import socket, struct, io
 from PIL import Image
 
-CAM_ORDER = ['chest', 'top', 'wrist_2']    # 必须与 policy_config['camera_names'] 一致
+# 线上发送顺序固定；与 policy_config['camera_names'] 的重排无关
+WIRE_CAMS = ['top', 'chest', 'wrist2']
 
-def query(sock, robot_state, refresh, cam_images_pil):
-    # robot_state: np.ndarray shape (7,) float32; cam_images_pil: dict[str, PIL.Image]
-    body  = struct.pack('>7f', *robot_state)
-    body += struct.pack('>I', int(refresh))
-    body += struct.pack('>I', len(CAM_ORDER))
-    for cam in CAM_ORDER:
+def query(sock, robot_state, cam_images_pil, text: str = ''):
+    # robot_state: np.ndarray shape (7,) float32
+    # cam_images_pil: dict 至少含 'top'/'chest'/'wrist2'（或 'wrist_2'）
+    body = b''
+    for key in WIRE_CAMS:
+        img = cam_images_pil.get(key) or cam_images_pil.get('wrist_2' if key == 'wrist2' else key)
         buf = io.BytesIO()
-        cam_images_pil[cam].save(buf, format='JPEG', quality=95)
+        img.save(buf, format='JPEG', quality=95)
         jpeg = buf.getvalue()
         body += struct.pack('>I', len(jpeg)) + jpeg
+    text_b = text.encode('utf-8')
+    body += struct.pack('>I', len(text_b)) + text_b
+    body += struct.pack('>7f', *robot_state)
     sock.sendall(body)
-    return struct.unpack('>7f', _recv_exact(sock, 28))
+
+    next_state = struct.unpack('>7f', _recv_exact(sock, 28))
+    term = struct.unpack('>I', _recv_exact(sock, 4))[0]
+    reject = struct.unpack('>I', _recv_exact(sock, 4))[0]
+    text_len = struct.unpack('>I', _recv_exact(sock, 4))[0]
+    _ = _recv_exact(sock, text_len) if text_len else b''
+    return next_state  # 也可按需使用 term / reject
 
 def _recv_exact(sock, n):
     buf = b''
@@ -256,11 +273,11 @@ def _recv_exact(sock, n):
         buf += pkt
     return buf
 
-# 用法：
+# 用法：每个 episode 新建连接；连接内连续发帧
 sock = socket.create_connection(('<server_host>', 5000))
-next_state = query(sock, robot_state, refresh=1, cam_images_pil=...)   # 首帧 refresh=1
+next_state = query(sock, robot_state, cam_images_pil)
 for step in range(N_steps):
-    next_state = query(sock, get_current_state(), refresh=0, cam_images_pil=capture_all_cams())
+    next_state = query(sock, get_current_state(), capture_all_cams())
     drive_robot(next_state)
 ```
 
@@ -352,7 +369,7 @@ print(f'rx: min={rxs.min():.3f}  max={rxs.max():.3f}  '
 - [ ] `policy_config.json` 中 `use_sam2_features=false`、`camera_names` 列表与转换时一致
 - [ ] 训练 20 epoch 内 `val loss` 单调下降无 NaN
 - [ ] `scripts/smoke_infer_tonglu.py` 跑出 `=== PASS ===`、`img_t shape=(1, N, 3, 480, 640)`
-- [ ] 实机闭环：服务端 log 里 `[addr] connected (baseline multi-cam (['chest','top','wrist_2']))`、`num_cams` 不匹配会在终端立刻报
+- [ ] 实机闭环：服务端 log 里 `wire_protocol=baseline_vla`、`[addr] connected (baseline multi-cam (['chest','top','wrist_2']))`；相机映射失败会立刻在终端报错
 
 ## 7. 把工程拷贝到新机器
 
@@ -425,7 +442,7 @@ python serve.py \
 | `No <prefix>_*.jpg frames in <ep>` | jpg 文件名不是 `rgb_chest_<N>.jpg` 格式,改名 / 检查 `--camera-names` |
 | `dataset_info.json` 中 `num_total=0` | 所有 episode 都被 annotation 跳过；`grep -c "skipped" log` |
 | `state_dict mismatch` 加载 ckpt | `policy_config.json` 的 `camera_names`、`state_dim`、`hidden_dim` 必须与训练时一致;别改了配置再加载老 ckpt |
-| serve.py 打印 `protocol mismatch: client sent num_cams=...` | 客户端发的相机数 ≠ ckpt 训练时的相机数；对齐顺序和数量 |
+| serve.py 打印 `camera mapping failed` / 客户端卡死 | 线上必须按 top→chest→wrist2 发三路 JPEG + text + 28B state，且回复要读 term/reject/text；不要发 refresh/num_cams |
 | 闭环上机预测乱跳 | 检查 client 是否对 `next_state` 中 `gripper` 维做了反归一化（serve 已 clip 到 [0, 1.13]）；rx_unwrapped 是否两边对齐 |
 | GPU 余量小 | `--batch-size 8` 起步;3 相机 ResNet18 输入比单相机大 3× |
 
@@ -434,7 +451,7 @@ python serve.py \
 本管线和 SAM2Grasp 路径（`extract_sam2_features.py` + `--use-sam2-features` 训练 + serve.py SAM2 分支）**完全独立**：
 
 - 选择由 `policy_config.json` 的 `use_sam2_features` 自动决定,无需手动切
-- SAM2 路径的旧线协议（hard-coded wrist + rear_left + state + refresh + bbox）`serve.py` 仍兼容,100_15 实机部署不受影响
+- SAM2 路径的旧线协议（`wire_protocol=sam2_legacy`：wrist + rear_left + state + refresh + 可选 16B bbox）`serve.py` 仍兼容，100_15 实机部署不受影响
 - 多相机基线和 SAM2Grasp 单相机+prompt **不能同时用同一个 ckpt 部署**,因为模型权重和输入形态都不同
 
 如果你要在同一台机器上同时跑两套,起两个 `serve.py` 进程,各自指向自己的 ckpt 目录、监听不同端口。
