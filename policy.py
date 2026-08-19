@@ -29,7 +29,11 @@ class ACTPolicy(nn.Module):
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
-            l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+            # 只对非 pad 位置求均值；旧 .mean() 分母含 pad，高 padding 比例的
+            # episode 会人为压低 val loss，导致 policy_best.ckpt 变成早期虚假最优。
+            mask = (~is_pad).unsqueeze(-1).float()
+            denom = mask.sum() * actions.size(-1)
+            l1 = (all_l1 * mask).sum() / denom.clamp(min=1.0)
             loss_dict['l1'] = l1
             loss_dict['kl'] = total_kld[0]
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
