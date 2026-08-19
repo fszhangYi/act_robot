@@ -49,7 +49,7 @@ import argparse
 import json
 import random
 from pathlib import Path
-a=1
+
 import h5py
 import numpy as np
 from PIL import Image

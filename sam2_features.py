@@ -26,6 +26,49 @@ import torch
 from PIL import Image
 
 
+_SAM2_CKPT_URL = (
+    'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt'
+)
+_DEFAULT_SAM2_CKPT_REL = 'checkpoints/sam2.1_hiera_small.pt'
+
+
+def resolve_sam2_ckpt(ckpt_path: str | None = None) -> str:
+    """解析 SAM2 权重路径：显式参数 > 环境变量 SAM2_CKPT > 仓库相对默认路径。
+
+    默认相对路径为 ``checkpoints/sam2.1_hiera_small.pt``；若不存在则再尝试
+    README 习惯路径 ``sam2/checkpoints/sam2.1_hiera_small.pt``。文件缺失时抛出
+    带 wget 命令的 FileNotFoundError，避免写死本机绝对路径。
+    """
+    repo_root = Path(__file__).resolve().parent
+    if ckpt_path:
+        path = Path(ckpt_path).expanduser()
+    elif os.environ.get('SAM2_CKPT'):
+        path = Path(os.environ['SAM2_CKPT']).expanduser()
+    else:
+        path = repo_root / _DEFAULT_SAM2_CKPT_REL
+        if not path.is_file():
+            alt = repo_root / 'sam2' / 'checkpoints' / 'sam2.1_hiera_small.pt'
+            if alt.is_file():
+                path = alt
+
+    if not path.is_absolute():
+        # 相对路径：先相对 cwd，再相对仓库根
+        cand = (Path.cwd() / path).resolve()
+        path = cand if cand.is_file() else (repo_root / path).resolve()
+    else:
+        path = path.resolve()
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'SAM2 checkpoint not found: {path}\n'
+            f'Download with:\n'
+            f'  mkdir -p checkpoints && wget -O checkpoints/sam2.1_hiera_small.pt \\\n'
+            f'    {_SAM2_CKPT_URL}\n'
+            f'Or set --sam2-ckpt / env SAM2_CKPT to an existing file.'
+        )
+    return str(path)
+
+
 def _strip_sam2_repo_shadow() -> None:
     """Prevent the act_robot/sam2/ repo dir from shadowing the installed sam2 package.
 
@@ -69,12 +112,13 @@ class SAM2FeatureExtractor:
     def __init__(
         self,
         config_file: str = 'configs/sam2.1/sam2.1_hiera_s.yaml',
-        ckpt_path: str = '/home/znyyb/hww/vla/act_robot/sam2/checkpoints/sam2.1_hiera_small.pt',
+        ckpt_path: str | None = None,
         device: str = 'cuda',
     ) -> None:
         _strip_sam2_repo_shadow()  # re-apply in case sys.path was mutated after module load
         from sam2.build_sam import build_sam2_video_predictor
 
+        ckpt_path = resolve_sam2_ckpt(ckpt_path)
         self.device = device
         self.predictor = build_sam2_video_predictor(config_file, ckpt_path, device=device)
         self._captured_pix_feat: torch.Tensor | None = None
@@ -193,12 +237,13 @@ class SAM2StreamingFeatureExtractor:
     def __init__(
         self,
         config_file: str = 'configs/sam2.1/sam2.1_hiera_s.yaml',
-        ckpt_path: str = '/home/znyyb/hww/vla/act_robot/sam2/checkpoints/sam2.1_hiera_small.pt',
+        ckpt_path: str | None = None,
         device: str = 'cuda',
     ) -> None:
         _strip_sam2_repo_shadow()  # re-apply in case sys.path was mutated after module load
         from sam2.build_sam import build_sam2_video_predictor
 
+        ckpt_path = resolve_sam2_ckpt(ckpt_path)
         self.device = device
         self.predictor = build_sam2_video_predictor(config_file, ckpt_path, device=device)
         self.image_size = self.predictor.image_size

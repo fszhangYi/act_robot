@@ -179,8 +179,9 @@ def main() -> None:
     parser.add_argument('--feat-dtype', default='float16',
                         choices=['float16', 'float32'])
     parser.add_argument('--sam2-config', default='configs/sam2.1/sam2.1_hiera_s.yaml')
-    parser.add_argument('--sam2-ckpt',
-                        default='/home/znyyb/hww/vla/act_robot/sam2/checkpoints/sam2.1_hiera_small.pt')
+    parser.add_argument('--sam2-ckpt', default=None,
+                        help='SAM2 权重路径。默认：环境变量 SAM2_CKPT，否则 '
+                             'checkpoints/sam2.1_hiera_small.pt（或 sam2/checkpoints/ 下同名文件）')
     args = parser.parse_args()
 
     random.seed(args.seed)

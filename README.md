@@ -230,9 +230,12 @@ Server → Client：
 SAM2_BUILD_CUDA=0 /home/znyyb/miniconda3/envs/anygrasp/bin/pip install -e sam2 \
     --no-deps --no-build-isolation --ignore-requires-python
 
-# 下载 small ckpt（~176MB）
-wget -O sam2/checkpoints/sam2.1_hiera_small.pt \
+# 下载 small ckpt（~176MB）—— 默认路径与 resolve_sam2_ckpt 一致
+mkdir -p checkpoints
+wget -O checkpoints/sam2.1_hiera_small.pt \
     https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
+# 也可: export SAM2_CKPT=/path/to/sam2.1_hiera_small.pt
+# 或:   --sam2-ckpt /path/to/sam2.1_hiera_small.pt
 ```
 
 ### Step 1：Stage-1 离线特征抽取

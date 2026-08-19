@@ -265,8 +265,10 @@ class ACTInference:
     """Inference wrapper that auto-selects baseline ACT (multi-camera) or SAM2Grasp
     ACT based on the checkpoint's policy_config.json `use_sam2_features` flag."""
 
-    def __init__(self, checkpoint_path: str, stats_path: str, device: str = 'cuda'):
+    def __init__(self, checkpoint_path: str, stats_path: str, device: str = 'cuda',
+                 sam2_ckpt: str | None = None):
         self.device = torch.device(device)
+        self.sam2_ckpt = sam2_ckpt
 
         with open(stats_path, 'rb') as f:
             stats = pickle.load(f)
@@ -325,7 +327,8 @@ class ACTInference:
                 self.policy = ACTSAM2CVAEPolicy(policy_config)
             else:
                 self.policy = ACTSAM2Policy(policy_config)
-            self.sam2 = SAM2StreamingFeatureExtractor(device=device)
+            self.sam2 = SAM2StreamingFeatureExtractor(
+                device=device, ckpt_path=sam2_ckpt)
         else:
             self.policy = ACTPolicy(policy_config)
             self.sam2 = None
@@ -642,6 +645,9 @@ def main() -> None:
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5000)
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--sam2-ckpt', default=None,
+                        help='SAM2 权重路径（仅 --use-sam2 / use_sam2_features=true 时需要）。'
+                             '默认：环境变量 SAM2_CKPT，否则 checkpoints/sam2.1_hiera_small.pt')
     inf_mode_group = parser.add_mutually_exclusive_group()
     inf_mode_group.add_argument('--temporal-agg', action='store_true')
     inf_mode_group.add_argument('--always-first', action='store_true')
@@ -656,7 +662,8 @@ def main() -> None:
 
     mode = 'chunk_replay'
 
-    inferencer = ACTInference(args.checkpoint, args.stats, args.device)
+    inferencer = ACTInference(
+        args.checkpoint, args.stats, args.device, sam2_ckpt=args.sam2_ckpt)
     mode_label = {'temporal_agg': 'temporal-agg',
                   'always_first': 'always-first (per-step, chunk[0] only)',
                   'chunk_replay': f'chunk-replay (chunk_size={inferencer.chunk_size})'}[mode]
