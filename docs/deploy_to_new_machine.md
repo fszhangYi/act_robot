@@ -159,7 +159,7 @@ python serve.py \
 | `No <prefix>_*.jpg frames in <ep>` | jpg 文件名格式不对,或 `--camera-names` 拼写错;参考 [`tonglu0602.md` §1](tonglu0602.md) |
 | `dataset_info.json` 中 `num_total=0` | 所有 episode 都被 annotation 跳过(`-1`);看打印的 skip 列表 |
 | `state_dict mismatch` 加载 ckpt | `policy_config.json` 必须和训练时一致,不要改了 `--camera-names` / `--chunk-size` 再 load 老 ckpt |
-| serve.py 打印 `protocol mismatch: num_cams=...` | 客户端发的相机数 ≠ ckpt 的 camera_names 数;对齐顺序+数量 |
+| serve.py 打印 `camera mapping failed` / 客户端卡死 | 基线协议是 top→chest→wrist2 JPEG + text + 28B state（无 refresh/num_cams），回复还含 term/reject/text；对齐字节布局 |
 | 训练 OOM | `--batch-size` 减半;3 相机 ResNet18 + 480×640 比单相机吃 3 倍 |
 
 ## 验证清单
