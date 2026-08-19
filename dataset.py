@@ -9,7 +9,36 @@ import torch
 from torch.utils.data import Dataset
 
 
-class EpisodicDataset(Dataset):
+class _Hdf5CacheMixin:
+    """在当前进程内缓存已打开的 HDF5，避免每个 __getitem__ 反复 open/close。
+
+    DataLoader 多 worker 时每个 worker 进程各自持有一份缓存；配合
+    persistent_workers=True 可跨 epoch 复用句柄。
+    """
+
+    def _init_hdf5_cache(self) -> None:
+        self._hdf5_cache: dict[str, h5py.File] = {}
+
+    def _open_hdf5(self, path: str) -> h5py.File:
+        f = self._hdf5_cache.get(path)
+        if f is None:
+            f = h5py.File(path, 'r')
+            self._hdf5_cache[path] = f
+        return f
+
+    def __del__(self) -> None:
+        cache = getattr(self, '_hdf5_cache', None)
+        if not cache:
+            return
+        for f in cache.values():
+            try:
+                f.close()
+            except Exception:
+                pass
+        cache.clear()
+
+
+class EpisodicDataset(_Hdf5CacheMixin, Dataset):
     """Load pre-converted HDF5 episodes for ACT training.
 
     Each HDF5 file contains:
@@ -17,16 +46,22 @@ class EpisodicDataset(Dataset):
         /observations/qvel      [T, state_dim]
         /observations/images/wrist  [T, H, W, 3] uint8
         /action                 [T, action_dim]
+
+    只读取 ``action[start_ts : start_ts+chunk_size]`` 并 pad 到 chunk_size，
+    不再 pad 到整段 max_episode_len（policy 里也会再切 [:num_queries]）。
     """
 
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_episode_len):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats,
+                 max_episode_len, chunk_size: int = 10):
         super().__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
-        self.max_episode_len = max_episode_len
+        self.max_episode_len = max_episode_len  # 保留供调试 / 兼容
+        self.chunk_size = int(chunk_size)
         self.is_sim = True
+        self._init_hdf5_cache()
 
     def __len__(self):
         return len(self.episode_ids)
@@ -34,23 +69,23 @@ class EpisodicDataset(Dataset):
     def __getitem__(self, index):
         episode_id = self.episode_ids[index]
         dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
-        with h5py.File(dataset_path, 'r') as root:
-            original_action_shape = root['/action'].shape
-            episode_len = original_action_shape[0]
-            start_ts = np.random.choice(episode_len)
+        root = self._open_hdf5(dataset_path)
+        original_action_shape = root['/action'].shape
+        episode_len = original_action_shape[0]
+        start_ts = np.random.choice(episode_len)
 
-            qpos = root['/observations/qpos'][start_ts]
-            qvel = root['/observations/qvel'][start_ts]
-            image_dict = {
-                cam: root[f'/observations/images/{cam}'][start_ts]
-                for cam in self.camera_names
-            }
-            action = root['/action'][start_ts:]
-            action_len = episode_len - start_ts
+        qpos = root['/observations/qpos'][start_ts]
+        image_dict = {
+            cam: root[f'/observations/images/{cam}'][start_ts]
+            for cam in self.camera_names
+        }
+        end_ts = min(start_ts + self.chunk_size, episode_len)
+        action = root['/action'][start_ts:end_ts]
+        action_len = end_ts - start_ts
 
-        padded_action = np.zeros((self.max_episode_len, original_action_shape[1]), dtype=np.float32)
+        padded_action = np.zeros((self.chunk_size, original_action_shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
-        is_pad = np.zeros(self.max_episode_len, dtype=bool)
+        is_pad = np.zeros(self.chunk_size, dtype=bool)
         is_pad[action_len:] = True
 
         all_cam_images = np.stack([image_dict[cam] for cam in self.camera_names], axis=0)
@@ -68,7 +103,7 @@ class EpisodicDataset(Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-class SAM2EpisodicDataset(Dataset):
+class SAM2EpisodicDataset(_Hdf5CacheMixin, Dataset):
     """Load pre-extracted SAM2 features for training the deterministic ACT head.
 
     Each HDF5 file (written by extract_sam2_features.py) contains:
@@ -89,7 +124,7 @@ class SAM2EpisodicDataset(Dataset):
     """
 
     def __init__(self, episode_ids, dataset_dir, norm_stats, max_episode_len,
-                 action_repr: str = 'absolute'):
+                 action_repr: str = 'absolute', chunk_size: int = 10):
         super().__init__()
         assert action_repr in ('absolute', 'delta')
         self.episode_ids = episode_ids
@@ -97,6 +132,8 @@ class SAM2EpisodicDataset(Dataset):
         self.norm_stats = norm_stats
         self.max_episode_len = max_episode_len
         self.action_repr = action_repr
+        self.chunk_size = int(chunk_size)
+        self._init_hdf5_cache()
 
     def __len__(self):
         return len(self.episode_ids)
@@ -104,14 +141,15 @@ class SAM2EpisodicDataset(Dataset):
     def __getitem__(self, index):
         episode_id = self.episode_ids[index]
         path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
-        with h5py.File(path, 'r') as root:
-            T, action_dim = root['/action'].shape
-            start_ts = np.random.choice(T)
+        root = self._open_hdf5(path)
+        T, action_dim = root['/action'].shape
+        start_ts = np.random.choice(T)
 
-            qpos = root['/observations/qpos'][start_ts]
-            sam2_feat = root['/observations/sam2_feat'][start_ts]  # [256, 64, 64]
-            action = root['/action'][start_ts:]
-            action_len = T - start_ts
+        qpos = root['/observations/qpos'][start_ts]
+        sam2_feat = root['/observations/sam2_feat'][start_ts]  # [256, 64, 64]
+        end_ts = min(start_ts + self.chunk_size, T)
+        action = root['/action'][start_ts:end_ts]
+        action_len = end_ts - start_ts
 
         if self.action_repr == 'delta':
             # target_k = action[start_ts + k] - qpos[start_ts]  for k in [0, action_len)
@@ -123,9 +161,9 @@ class SAM2EpisodicDataset(Dataset):
             target_mean = self.norm_stats['action_mean']
             target_std = self.norm_stats['action_std']
 
-        padded_target = np.zeros((self.max_episode_len, action_dim), dtype=np.float32)
+        padded_target = np.zeros((self.chunk_size, action_dim), dtype=np.float32)
         padded_target[:action_len] = target
-        is_pad = np.zeros(self.max_episode_len, dtype=bool)
+        is_pad = np.zeros(self.chunk_size, dtype=bool)
         is_pad[action_len:] = True
 
         sam2_feat_t = torch.from_numpy(sam2_feat.astype(np.float32))   # [256, 64, 64]

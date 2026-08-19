@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import pickle
+import random
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -41,6 +42,14 @@ from policy import ACTPolicy, ACTSAM2Policy, ACTSAM2CVAEPolicy
 
 # TensorBoard — writer is created in main() so logs land in ckpt_dir/runs/
 from torch.utils.tensorboard import SummaryWriter
+
+
+def _seed_worker(worker_id: int) -> None:
+    """保证 DataLoader worker 内的 numpy/random 可复现。"""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -494,16 +503,33 @@ def main() -> None:
     camera_names = args.camera_names
     if args.use_sam2_features:
         train_dataset = SAM2EpisodicDataset(train_indices, data_dir, norm_stats,
-                                            max_episode_len, action_repr=args.action_repr)
+                                            max_episode_len, action_repr=args.action_repr,
+                                            chunk_size=args.chunk_size)
         val_dataset = SAM2EpisodicDataset(val_indices, data_dir, norm_stats,
-                                          max_episode_len, action_repr=args.action_repr)
+                                          max_episode_len, action_repr=args.action_repr,
+                                          chunk_size=args.chunk_size)
     else:
-        train_dataset = EpisodicDataset(train_indices, data_dir, camera_names, norm_stats, max_episode_len)
-        val_dataset = EpisodicDataset(val_indices, data_dir, camera_names, norm_stats, max_episode_len)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
+        train_dataset = EpisodicDataset(train_indices, data_dir, camera_names, norm_stats,
+                                        max_episode_len, chunk_size=args.chunk_size)
+        val_dataset = EpisodicDataset(val_indices, data_dir, camera_names, norm_stats,
+                                      max_episode_len, chunk_size=args.chunk_size)
+
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(args.seed)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        worker_init_fn=_seed_worker if args.num_workers > 0 else None,
+        generator=loader_gen,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=min(2, args.num_workers) if args.num_workers > 0 else 0,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        worker_init_fn=_seed_worker if args.num_workers > 0 else None,
+    )
 
     if args.use_sam2_features:
         policy_config = {
