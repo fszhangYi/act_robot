@@ -42,7 +42,8 @@ Usage:
         --annotation-dir <dataset>/annotation \\
         --camera-names chest top wrist_2 \\
         --action-space cartesian_abs --stride 1 --unwrap-rx \\
-        --num-workers 4
+        --num-workers 4 \\
+        --filter-json data/quality_pass.json
 """
 from __future__ import annotations
 
@@ -190,6 +191,21 @@ def _parse_gripper(raw) -> np.ndarray:
             return arr[0]
         return arr.squeeze(-1)
     return arr
+
+
+def _load_episode_filter(filter_json: Path) -> set[int]:
+    """Load episode whitelist from a JSON array of integer indices."""
+    if not filter_json.is_file():
+        raise FileNotFoundError(f'filter-json not found: {filter_json}')
+    payload = json.loads(filter_json.read_text(encoding='utf-8'))
+    if not isinstance(payload, list):
+        raise ValueError(f'filter-json must be a JSON array, got {type(payload).__name__}')
+    allowed: set[int] = set()
+    for item in payload:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(f'filter-json entries must be integers, got {item!r}')
+        allowed.add(item)
+    return allowed
 
 
 def _parse_annotation(annot_path: Path) -> tuple[int, int] | None:
@@ -516,6 +532,10 @@ def main() -> None:
                         help='Shift qpos[3]<0 (and action[3] for cart_abs) by +2π so the rx '
                              'distribution is single-peaked. dataset_info.json records '
                              '`rx_unwrapped=true`; serve.py inverts at inference.')
+    parser.add_argument('--filter-json', default=None,
+                        help='Optional JSON array of episode indices to convert. '
+                             'Only episodes whose directory name is in this whitelist are kept '
+                             '(typically output of check_episode_quality.py --write-pass-json).')
     parser.add_argument('--skip-existing', action='store_true',
                         help='Skip episodes whose output HDF5 already exists and is valid. '
                              'Useful for resuming an interrupted conversion run (same seed '
@@ -540,13 +560,26 @@ def main() -> None:
     if not episode_dirs:
         raise RuntimeError(f'No numeric episode directories found under {input_dir}')
 
+    filter_path = Path(args.filter_json) if args.filter_json else None
+    allowed_indices: set[int] | None = None
+    if filter_path is not None:
+        allowed_indices = _load_episode_filter(filter_path)
+        before = len(episode_dirs)
+        episode_dirs = [d for d in episode_dirs if int(d.name) in allowed_indices]
+        print(f'Filter JSON: {filter_path}  |  kept {len(episode_dirs)}/{before} episodes')
+        if not episode_dirs:
+            raise RuntimeError(
+                f'No episodes left after applying filter-json {filter_path}'
+            )
+
     random.shuffle(episode_dirs)
     n_train = int(len(episode_dirs) * args.train_ratio)
     train_eps = episode_dirs[:n_train]
     val_eps = episode_dirs[n_train:]
     print(f'Episodes: {len(episode_dirs)} total  |  train={len(train_eps)}  val={len(val_eps)}  '
           f'stride={args.stride}  action_space={args.action_space}  '
-          f'annotation={"yes" if annot_dir else "no"}  unwrap_rx={args.unwrap_rx}  '
+          f'annotation={"yes" if annot_dir else "no"}  '
+          f'filter={"yes" if filter_path else "no"}  unwrap_rx={args.unwrap_rx}  '
           f'num_workers={args.num_workers}')
 
     skipped_no_annot: list[str] = []
@@ -584,6 +617,7 @@ def main() -> None:
         'stride': args.stride,
         'train_ratio': args.train_ratio,
         'seed': args.seed,
+        'filter_json': str(filter_path) if filter_path else None,
         'num_total': global_idx,
         'num_train': len(train_indices),
         'num_val': len(val_indices),
