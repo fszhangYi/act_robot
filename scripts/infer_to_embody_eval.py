@@ -5,7 +5,9 @@ Maps offline inference (cartesian_abs or joint) plus raw steps.json joint
 logs into the viewer schema: meta + series + frames with 8-element joint
 vectors (6 arm joints in degrees + mirrored gripper pair).
 
-IK for cartesian predictions is a placeholder (returns seed joints unchanged).
+Cartesian predictions are converted to joint targets via in-repo EC616 IK
+(``ec616_kin.ik_flange``). Raw cartesian is TCP pose; default tool offset
+Z = +0.18 m (flange → TCP).
 
 Usage:
     # Single episode
@@ -28,6 +30,7 @@ import json
 import math
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,9 +38,15 @@ from typing import Any
 import numpy as np
 
 _ROOT = Path(__file__).resolve().parent.parent
+_SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_SCRIPTS))
 
 from convert_episodes import _parse_gripper  # noqa: E402
+from ec616_ik import (  # noqa: E402
+    DEFAULT_TCP_TOOL_Z_M,
+    solve_ik_cartesian_to_joint,
+)
 
 EC616_JOINT_NAMES = [
     'Joint1',
@@ -59,17 +68,11 @@ DEFAULT_GOAL_EC616 = {
 }
 
 
-def solve_ik_cartesian_to_joint(
-    cartesian6: np.ndarray,
-    seed_joint6_rad: np.ndarray,
-) -> np.ndarray:
-    """Placeholder IK: cartesian target → 6 joint angles (rad).
-
-    TODO: replace with EC616 inverse kinematics.
-    Currently returns seed joints unchanged.
-    """
-    _ = cartesian6
-    return np.asarray(seed_joint6_rad, dtype=np.float64).copy()
+@dataclass
+class IkOptions:
+    tcp_tool_z_m: float = DEFAULT_TCP_TOOL_Z_M
+    enforce_soft_limits: bool = False
+    fallback_to_seed: bool = True
 
 
 def gripper_pair_deg(grip_rad: float) -> tuple[float, float]:
@@ -102,6 +105,7 @@ def convert_infer_episode(
     raw_dir: Path,
     fps: float = 30.0,
     suite: str = 'ec616_act',
+    ik_options: IkOptions | None = None,
 ) -> dict[str, Any]:
     """Convert one infer JSON payload to embody_model_eval episode dict."""
     summary = infer_payload.get('summary') or {}
@@ -124,6 +128,8 @@ def convert_infer_episode(
 
     ckpt = summary.get('checkpoint')
     policy = Path(ckpt).parent.name if ckpt else None
+    ik = ik_options or IkOptions()
+    ik_failures = 0
 
     states: list[list[float]] = []
     gt_actions: list[list[float]] = []
@@ -145,7 +151,15 @@ def convert_infer_episode(
         if action_space == 'joint':
             pred_joint6 = pred0[:6]
         else:
-            pred_joint6 = solve_ik_cartesian_to_joint(pred0[:6], joint_pos[ri])
+            pred_joint6, ik_ok = solve_ik_cartesian_to_joint(
+                pred0[:6],
+                joint_pos[ri],
+                tcp_tool_z_m=ik.tcp_tool_z_m,
+                enforce_soft_limits=ik.enforce_soft_limits,
+                fallback_to_seed=ik.fallback_to_seed,
+            )
+            if not ik_ok:
+                ik_failures += 1
 
         next_pred = to_ec616_vec8(pred_joint6, pred0[6])
 
@@ -153,7 +167,7 @@ def convert_infer_episode(
         gt_actions.append(next_gt)
         pred_actions.append(next_pred)
 
-    return build_embody_payload(
+    payload = build_embody_payload(
         states=states,
         gt_actions=gt_actions,
         pred_actions=pred_actions,
@@ -167,7 +181,14 @@ def convert_infer_episode(
         model=action_space,
         ckpt=ckpt,
         infer_summary=summary,
+        extra_meta={
+            'ik_backend': 'ec616_kin.ik_flange',
+            'tcp_tool_z_m': ik.tcp_tool_z_m,
+            'ik_failures': ik_failures,
+            'ik_frames': len(frames_in) if action_space != 'joint' else 0,
+        },
     )
+    return payload
 
 
 def build_embody_payload(
@@ -185,6 +206,7 @@ def build_embody_payload(
     model: str | None = None,
     ckpt: str | None = None,
     infer_summary: dict[str, Any] | None = None,
+    extra_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     n = len(states)
     dof = len(joint_names)
@@ -263,6 +285,8 @@ def build_embody_payload(
             )
             if k in infer_summary
         }
+    if extra_meta:
+        meta.update(extra_meta)
 
     return {
         'meta': meta,
@@ -292,13 +316,16 @@ def convert_infer_file(
     output_path: Path,
     fps: float,
     suite: str,
+    ik_options: IkOptions | None = None,
 ) -> dict[str, Any]:
     payload = json.loads(infer_path.read_text(encoding='utf-8'))
     if 'summary' not in payload:
         payload = {'summary': {}, 'frames': payload.get('frames', payload)}
     ep = _infer_episode_id(infer_path)
     payload.setdefault('summary', {})['episode'] = ep
-    out = convert_infer_episode(payload, raw_dir=raw_dir, fps=fps, suite=suite)
+    out = convert_infer_episode(
+        payload, raw_dir=raw_dir, fps=fps, suite=suite, ik_options=ik_options,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(out, indent=2), encoding='utf-8')
     return out
@@ -330,7 +357,23 @@ def main() -> int:
         default=Path('/root/autodl-tmp/embody_model_eval'),
         help='embody_model_eval repo root (for --refresh-index)',
     )
+    parser.add_argument(
+        '--tcp-tool-z-m',
+        type=float,
+        default=DEFAULT_TCP_TOOL_Z_M,
+        help='Flange→TCP translation along flange Z (meters); default 0.18',
+    )
+    parser.add_argument(
+        '--ik-enforce-limits',
+        action='store_true',
+        help='Use TRF IK with teach soft joint limits',
+    )
     args = parser.parse_args()
+
+    ik_options = IkOptions(
+        tcp_tool_z_m=args.tcp_tool_z_m,
+        enforce_soft_limits=args.ik_enforce_limits,
+    )
 
     t0 = time.perf_counter()
     converted = 0
@@ -346,6 +389,7 @@ def main() -> int:
                 output_path=args.output,
                 fps=args.fps,
                 suite=args.suite,
+                ik_options=ik_options,
             )
             converted = 1
             print(f'Wrote {args.output}  ({out["meta"]["n_frames"]} frames, '
@@ -373,6 +417,7 @@ def main() -> int:
                     output_path=out_path,
                     fps=args.fps,
                     suite=args.suite,
+                    ik_options=ik_options,
                 )
                 converted += 1
                 print(f'[{i}/{len(paths)}] ep {ep}  {out["meta"]["n_frames"]} frames  '
