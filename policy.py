@@ -7,6 +7,55 @@ from detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_opti
 from detr.models.act_sam2 import build_act_sam2
 from detr.models.act_sam2_cvae import build_act_sam2_cvae
 
+# Keys returned by policy forward() for throughput monitoring — not losses.
+THROUGHPUT_METRIC_KEYS = frozenset({
+    'num_tokens',
+    'num_encoder_tokens',
+    'num_decoder_tokens',
+    'num_cvae_encoder_tokens',
+})
+
+
+def count_main_transformer_tokens(
+    spatial_h: int,
+    spatial_w: int,
+    num_queries: int,
+    *,
+    encoder_prefix: int = 2,
+) -> tuple[int, int, int]:
+    """Per-sample token counts aligned with detr.models.transformer.Transformer.
+
+    Encoder sequence = encoder_prefix (latent + proprio) + H*W spatial tokens.
+    Decoder sequence = num_queries action-chunk slots.
+    Returns (encoder_tokens, decoder_tokens, total_tokens).
+    """
+    enc = encoder_prefix + spatial_h * spatial_w
+    dec = num_queries
+    return enc, dec, enc + dec
+
+
+def _batch_throughput_metrics(
+    batch_size: int,
+    spatial_h: int,
+    spatial_w: int,
+    num_queries: int,
+    *,
+    encoder_prefix: int = 2,
+    cvae_encoder_tokens: int = 0,
+) -> dict[str, int]:
+    enc, dec, main_total = count_main_transformer_tokens(
+        spatial_h, spatial_w, num_queries, encoder_prefix=encoder_prefix,
+    )
+    total = main_total + cvae_encoder_tokens
+    out = {
+        'num_encoder_tokens': batch_size * enc,
+        'num_decoder_tokens': batch_size * dec,
+        'num_tokens': batch_size * total,
+    }
+    if cvae_encoder_tokens:
+        out['num_cvae_encoder_tokens'] = batch_size * cvae_encoder_tokens
+    return out
+
 
 class ACTPolicy(nn.Module):
     def __init__(self, args_override):
@@ -38,15 +87,14 @@ class ACTPolicy(nn.Module):
             loss_dict['kl'] = total_kld[0]
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
 
-            # ----- Add Token Calculation -----
+            # Throughput: encoder sees concat cameras along width → spatial_w *= num_cam
             B = image.shape[0]
-            # ResNet18 / 32
+            num_cameras = image.shape[1]
             H_feat = image.shape[-2] // 32
             W_feat = image.shape[-1] // 32
-            num_visual_tokens = H_feat * W_feat
-            num_action_tokens = self.model.num_queries
-            loss_dict['num_tokens'] = B * (num_action_tokens + num_visual_tokens)
-            # Token Calculation End
+            loss_dict.update(_batch_throughput_metrics(
+                B, H_feat, W_feat * num_cameras, self.model.num_queries,
+            ))
 
             return loss_dict
         else:  # inference
@@ -114,7 +162,15 @@ class ACTSAM2Policy(nn.Module):
         # apparent "best val" hit an early-but-misleading minimum.
         denom = mask.sum() * actions.size(-1)
         l2 = (all_l2 * mask).sum() / denom.clamp(min=1.0)
-        return {'l2': l2, 'loss': l2}
+        B = sam2_feat.shape[0]
+        pool = self.model.pool_size
+        if pool:
+            h = w = int(pool)
+        else:
+            h, w = int(sam2_feat.shape[-2]), int(sam2_feat.shape[-1])
+        out = {'l2': l2, 'loss': l2}
+        out.update(_batch_throughput_metrics(B, h, w, self.num_queries))
+        return out
 
     def configure_optimizers(self):
         return self.optimizer
@@ -178,6 +234,17 @@ class ACTSAM2CVAEPolicy(nn.Module):
             out['cum_l1'] = cum_l1
 
         out['loss'] = loss
+        B = sam2_feat.shape[0]
+        pool = self.model.pool_size
+        if pool:
+            h = w = int(pool)
+        else:
+            h, w = int(sam2_feat.shape[-2]), int(sam2_feat.shape[-1])
+        # CVAE action encoder: [CLS, qpos, action_0..action_{K-1}]
+        cvae_enc = 2 + self.num_queries
+        out.update(_batch_throughput_metrics(
+            B, h, w, self.num_queries, cvae_encoder_tokens=cvae_enc,
+        ))
         return out
 
     def configure_optimizers(self):

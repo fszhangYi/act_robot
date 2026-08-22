@@ -37,7 +37,12 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import EpisodicDataset, SAM2EpisodicDataset, get_norm_stats
-from policy import ACTPolicy, ACTSAM2Policy, ACTSAM2CVAEPolicy
+from policy import (
+    ACTPolicy,
+    ACTSAM2Policy,
+    ACTSAM2CVAEPolicy,
+    THROUGHPUT_METRIC_KEYS,
+)
 
 
 # TensorBoard — writer is created in main() so logs land in ckpt_dir/runs/
@@ -296,6 +301,9 @@ def train(
         batch_dicts: list[dict] = []
         log_every_n_batch = 20
         tokens_since_log = 0
+        encoder_tokens_since_log = 0
+        decoder_tokens_since_log = 0
+        cvae_tokens_since_log = 0
         samples_since_log = 0
         loss_since_log = 0.0
         n_batches_since_log = 0
@@ -311,19 +319,29 @@ def train(
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad()
-            batch_dicts.append({k: v.detach() for k, v in fwd.items() if k != 'num_tokens'})
+            batch_dicts.append({k: v.detach() for k, v in fwd.items()
+                                if k not in THROUGHPUT_METRIC_KEYS})
 
-            tokens_in_batch = fwd.get('num_tokens', None)
-            if tokens_in_batch is None:
-                # 回退：样本数 × chunk（SAM2 等未回传 num_tokens 时至少保证可算）
-                tokens_in_batch = int(batch[0].shape[0] * policy.model.num_queries)
-            elif torch.is_tensor(tokens_in_batch):
-                tokens_in_batch = int(tokens_in_batch.item())
-            else:
-                tokens_in_batch = int(tokens_in_batch)
+            def _metric_int(key: str) -> int:
+                val = fwd.get(key)
+                if val is None:
+                    return 0
+                if torch.is_tensor(val):
+                    return int(val.item())
+                return int(val)
+
+            tokens_in_batch = _metric_int('num_tokens')
+            if tokens_in_batch == 0:
+                # Legacy fallback when policy omits throughput fields (e.g. CNNMLP).
+                tokens_in_batch = int(
+                    batch[0].shape[0] * getattr(policy.model, 'num_queries', 0)
+                )
 
             batch_size = int(batch[0].shape[0])
             tokens_since_log += tokens_in_batch
+            encoder_tokens_since_log += _metric_int('num_encoder_tokens')
+            decoder_tokens_since_log += _metric_int('num_decoder_tokens')
+            cvae_tokens_since_log += _metric_int('num_cvae_encoder_tokens')
             samples_since_log += batch_size
             loss_since_log += float(fwd['loss'].item())
             n_batches_since_log += 1
@@ -337,6 +355,15 @@ def train(
                 if elapsed > 0:
                     writer.add_scalar('throughput/token_per_sec',
                                      tokens_since_log / elapsed, global_step)
+                    if encoder_tokens_since_log:
+                        writer.add_scalar('throughput/encoder_token_per_sec',
+                                         encoder_tokens_since_log / elapsed, global_step)
+                    if decoder_tokens_since_log:
+                        writer.add_scalar('throughput/decoder_token_per_sec',
+                                         decoder_tokens_since_log / elapsed, global_step)
+                    if cvae_tokens_since_log:
+                        writer.add_scalar('throughput/cvae_encoder_token_per_sec',
+                                         cvae_tokens_since_log / elapsed, global_step)
                     writer.add_scalar('throughput/sample_per_sec',
                                      samples_since_log / elapsed, global_step)
                 # 窗口内平均 loss，而非只记最后一 batch（原先会高估噪声）
@@ -345,7 +372,9 @@ def train(
                 writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
 
                 tokens_since_log = 0
-                samples_since_log = 0
+                encoder_tokens_since_log = 0
+                decoder_tokens_since_log = 0
+                cvae_tokens_since_log = 0
                 loss_since_log = 0.0
                 n_batches_since_log = 0
                 batch_start_time = time.perf_counter()
@@ -362,8 +391,8 @@ def train(
         policy.eval()
         with torch.inference_mode():
             epoch_dicts = [forward_pass(b, policy) for b in val_loader]
-        val_summary = {k: torch.stack([d[k] for d in epoch_dicts if d != 'num_tokens']).mean().item()
-                       for k in epoch_dicts[0] if k != 'num_tokens'}
+        val_summary = {k: torch.stack([d[k] for d in epoch_dicts]).mean().item()
+                       for k in epoch_dicts[0] if k not in THROUGHPUT_METRIC_KEYS}
         val_history.append(val_summary)
         epoch_val_loss = val_summary['loss']
         if epoch_val_loss < min_val_loss:
