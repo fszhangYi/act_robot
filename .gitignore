@@ -22,3 +22,9 @@ logs/
 *.swp
 runs/
 runs.bak/
+
+# Local datasets and converted HDF5 (large)
+data/
+
+# Pose compare web UI (moved to standalone project)
+scripts/pose_compare_web/
