@@ -11,9 +11,9 @@ Cursor **只会**自动发现这两个位置下的 skill（目录内需有 `SKIL
 | 项目级 | `<工作区>/.cursor/skills/<skill-name>/` |
 | 个人级 | `~/.cursor/skills/<skill-name>/` |
 
-版式规则见 `format-requirements.txt`（与 `docx 格式要求.txt` 同步）。样例文档：仓库内 `STAGE3.docx`（标题层级、居中图注、超链接 RGB(0,102,204) 等）。
+版式规则见 `format-requirements.txt`（与 `docx 格式要求.txt` 同步，含 §19 Mermaid→PNG）。样例文档：仓库内 `STAGE3.docx`（标题层级、居中图注、超链接 RGB(0,102,204) 等）。
 
-插图：docx 中先写 `【插图地址】assets/N.filename`，再尝试嵌入并缩放图片（§15）；强调引号「」自动转为 “”（§16）。
+插图：docx 中先写 `【插图地址】assets/N.filename`，再尝试嵌入并缩放图片（§15）；强调引号「」自动转为 “”（§16）；LaTeX 公式转为 Word 公式（§17）；代码块黑底白字（§18）；适合流程图的内容先 Mermaid 再转 PNG 插入（§19）。
 
 仅放在 `report/md-to-docx-report/` 或打成 zip **不会**出现在 Skills 面板。本仓库已同步安装到：
 
@@ -25,13 +25,14 @@ Cursor **只会**自动发现这两个位置下的 skill（目录内需有 `SKIL
 ## 安装依赖
 
 ```bash
-pip install python-docx
+pip install python-docx Pillow
 ```
 
 ## 命令行
 
 ```bash
 python scripts/md_to_docx.py input.md output.docx
+python scripts/mermaid_to_png.py diagram.mmd assets/diagram.png
 ```
 
 ## 手动安装

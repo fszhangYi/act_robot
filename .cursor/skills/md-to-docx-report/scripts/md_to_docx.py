@@ -22,6 +22,9 @@ Default format rules (docx 格式要求.txt):
   14. 超链接文字 RGB(0,102,204)，宋体/Times New Roman，字号与上下文一致
   15. 插图地址编号为 assets/N.filename；并尝试嵌入缩放图片
   16. 「…」→“… ”
+  17. LaTeX 公式转为 Word 公式（OMML）
+  18. 代码块整段黑底白字
+  19. 适合流程图的内容：先 Mermaid→PNG（见 mermaid_to_png.py），再按 §15 嵌入
 
 版式样例：STAGE3.docx（Heading 1–4、居中图注、真超链接）。
 """
@@ -39,6 +42,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from lxml import etree
 
 SIZE_BODY, SIZE_TABLE, SIZE_CODE = Pt(12), Pt(10.5), Pt(10.5)
 SIZE_H1, SIZE_H2, SIZE_H3, SIZE_H4 = Pt(18), Pt(16), Pt(14), Pt(12)
@@ -52,16 +56,299 @@ LINK_BLUE = "0066CC"
 # 嵌入图默认最大宽（窄页边距下可用宽约 18cm，取 14cm 留白）
 IMG_MAX_WIDTH = Cm(14)
 IMG_MAX_HEIGHT = Cm(18)
+CODE_BG = "000000"
+CODE_FG = RGBColor(255, 255, 255)
+MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
-INLINE_RE = re.compile(r"(\*\*.+?\*\*|`.+?`|\\\(.+?\\\))")
+INLINE_RE = re.compile(r"(\*\*.+?\*\*|`.+?`)")
 CAPTION_RE = re.compile(r"^\*?(图[：:].+|示意[：:].+)\*?$")
 MD_IMG_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)")
+# §17: delimited math first, then LaTeX-like fragments
+DELIM_MATH_RE = re.compile(
+    r"\$\$(.+?)\$\$|\\\[(.+?)\\\]|\\\((.+?)\\\)|(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)",
+    re.S,
+)
+BARE_MATH_RE = re.compile(
+    r"\([^()]*(?:\^|_\{|\\[a-zA-Z]+)[^()]*\)"
+    r"|[A-Za-z][A-Za-z0-9]*(?:\^\{[^}]*\}|\^[^\s{,_]|_\{[^}]*\})+"
+    r"|\\(?:neq|ne|leq|geq|times|cdot|pm|infty|rightarrow|leftarrow|in|subset|approx|equiv)(?![A-Za-z])"
+)
+LATEX_SYMBOLS = {
+    "neq": "≠",
+    "ne": "≠",
+    "leq": "≤",
+    "geq": "≥",
+    "times": "×",
+    "cdot": "·",
+    "pm": "±",
+    "infty": "∞",
+    "rightarrow": "→",
+    "leftarrow": "←",
+    "Rightarrow": "⇒",
+    "in": "∈",
+    "subset": "⊂",
+    "approx": "≈",
+    "equiv": "≡",
+    "ast": "*",
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "theta": "θ",
+    "lambda": "λ",
+    "mu": "μ",
+    "pi": "π",
+    "sigma": "σ",
+    "phi": "φ",
+    "omega": "ω",
+    "sum": "∑",
+    "prod": "∏",
+    "ldots": "…",
+    "cdots": "⋯",
+}
 
 
 def normalize_quotes(text: str) -> str:
     """docx 格式要求 §16：强调引号「…」→中文弯引号 “… ”。"""
     return text.replace("「", "“").replace("」", "”")
+
+
+def _me(tag: str):
+    return etree.Element("{%s}%s" % (MATH_NS, tag))
+
+
+def _m_val(el, val: str):
+    el.set("{%s}val" % MATH_NS, val)
+
+
+def _math_run(text: str, italic: bool | None = None):
+    """Build m:r. italic=None → auto (letters italic, others plain)."""
+    r = _me("r")
+    rPr = _me("rPr")
+    sty = _me("sty")
+    if italic is None:
+        italic = bool(text) and text.isalpha()
+    _m_val(sty, "i" if italic else "p")
+    rPr.append(sty)
+    r.append(rPr)
+    t = _me("t")
+    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    t.text = text
+    r.append(t)
+    return r
+
+
+def _math_join(nodes: list):
+    if len(nodes) == 1:
+        return nodes[0]
+    e = _me("e")
+    for n in nodes:
+        e.append(n)
+    return e
+
+
+class _LatexParser:
+    def __init__(self, s: str):
+        self.s = s.strip()
+        self.i = 0
+
+    def peek(self) -> str:
+        return self.s[self.i] if self.i < len(self.s) else ""
+
+    def parse_expr(self) -> list:
+        nodes = []
+        while self.i < len(self.s) and self.peek() not in ")}":
+            before = self.i
+            nodes.append(self.parse_scripted())
+            if self.i <= before:
+                break
+        return nodes or [_math_run("")]
+
+    def parse_group(self) -> list:
+        if self.peek() == "{":
+            self.i += 1
+            nodes = self.parse_expr()
+            if self.peek() == "}":
+                self.i += 1
+            return nodes
+        # Unbraced ^/_ takes one atom so a^*_{t,1} becomes sSubSup, not * with a subscript.
+        return [self.parse_atom()]
+
+    def parse_atom(self):
+        ch = self.peek()
+        if not ch:
+            return _math_run("")
+        if ch == "{":
+            return _math_join(self.parse_group())
+        if ch == "\\":
+            return self.parse_command()
+        if ch in "()[]":
+            self.i += 1
+            return _math_run(ch, italic=False)
+        if ch.isdigit() or ch in "=+-/*<>,.|:'":
+            j = self.i
+            while self.i < len(self.s) and (self.s[self.i].isdigit() or self.s[self.i] in ".,"):
+                self.i += 1
+            if self.i == j:
+                self.i += 1
+                return _math_run(ch, italic=False)
+            return _math_run(self.s[j : self.i], italic=False)
+        if ch.isalpha():
+            j = self.i
+            while self.i < len(self.s) and self.s[self.i].isalpha():
+                self.i += 1
+            return _math_run(self.s[j : self.i], italic=True)
+        self.i += 1
+        return _math_run(ch, italic=False)
+
+    def parse_command(self):
+        self.i += 1
+        if self.i < len(self.s) and not self.s[self.i].isalpha():
+            cmd = self.s[self.i]
+            self.i += 1
+            if cmd in "{}":
+                return _math_run(cmd, italic=False)
+            return _math_run(cmd, italic=False)
+        j = self.i
+        while self.i < len(self.s) and self.s[self.i].isalpha():
+            self.i += 1
+        cmd = self.s[j : self.i]
+        if cmd in ("left", "right"):
+            return self.parse_atom()
+        if cmd == "frac":
+            f = _me("f")
+            num = _me("num")
+            den = _me("den")
+            for n in self.parse_group():
+                num.append(n)
+            for n in self.parse_group():
+                den.append(n)
+            f.extend([num, den])
+            return f
+        if cmd in ("sqrt",):
+            rad = _me("rad")
+            deg = _me("deg")
+            e = _me("e")
+            for n in self.parse_group():
+                e.append(n)
+            rad.extend([deg, e])
+            return rad
+        if cmd in ("mathrm", "text", "textbf"):
+            return _math_join(self.parse_group())
+        if cmd in LATEX_SYMBOLS:
+            return _math_run(LATEX_SYMBOLS[cmd], italic=False)
+        return _math_run("\\" + cmd, italic=False)
+
+    def parse_scripted(self):
+        base = self.parse_atom()
+        sub = sup = None
+        # Use a tuple: "" in "^_" is True in Python and would loop forever at EOS.
+        while self.peek() in ("^", "_"):
+            mark = self.peek()
+            self.i += 1
+            grp = self.parse_group()
+            if mark == "_":
+                sub = grp
+            else:
+                sup = grp
+        if sub is None and sup is None:
+            return base
+        if sub is not None and sup is not None:
+            node = _me("sSubSup")
+            e, sub_el, sup_el = _me("e"), _me("sub"), _me("sup")
+            e.append(base)
+            for n in sub:
+                sub_el.append(n)
+            for n in sup:
+                sup_el.append(n)
+            node.extend([e, sub_el, sup_el])
+            return node
+        if sub is not None:
+            node = _me("sSub")
+            e, sub_el = _me("e"), _me("sub")
+            e.append(base)
+            for n in sub:
+                sub_el.append(n)
+            node.extend([e, sub_el])
+            return node
+        node = _me("sSup")
+        e, sup_el = _me("e"), _me("sup")
+        e.append(base)
+        for n in sup:
+            sup_el.append(n)
+        node.extend([e, sup_el])
+        return node
+
+
+def latex_to_omml(latex: str, display: bool = False):
+    """§17: convert LaTeX to Word OMML (m:oMath / m:oMathPara)."""
+    raw = latex.strip()
+    raw = raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    om = etree.Element("{%s}oMath" % MATH_NS, nsmap={"m": MATH_NS})
+    try:
+        nodes = _LatexParser(raw).parse_expr()
+        for n in nodes:
+            om.append(n)
+    except Exception:
+        om.append(_math_run(raw, italic=False))
+    if display:
+        para = etree.Element("{%s}oMathPara" % MATH_NS, nsmap={"m": MATH_NS})
+        para.append(om)
+        return para
+    return om
+
+
+def _merge_spans(spans: list[tuple[int, int, str, bool]], text: str):
+    if not spans:
+        return []
+    spans = sorted(spans)
+    out = [list(spans[0])]
+    for s, e, latex, disp in spans[1:]:
+        prev = out[-1]
+        gap = text[prev[1] : s]
+        raw_prev = text[prev[0] : prev[1]] == prev[2]
+        raw_cur = text[s:e] == latex
+        if (not disp) and (not prev[3]) and raw_prev and raw_cur and re.fullmatch(r"[\s\\]*", gap or ""):
+            prev[1] = e
+            prev[2] = text[prev[0] : e]
+        else:
+            out.append([s, e, latex, disp])
+    return [(a, b, c, d) for a, b, c, d in out]
+
+
+def extract_math_segments(text: str) -> list[tuple[str, str, bool]]:
+    """Yield (kind, payload, display) where kind is 'text' or 'math'."""
+    spans = []
+    for m in DELIM_MATH_RE.finditer(text):
+        latex = next(g for g in m.groups() if g is not None)
+        display = m.group(1) is not None or m.group(2) is not None
+        spans.append((m.start(), m.end(), latex, display))
+    occupied = [False] * (len(text) + 1)
+    for s, e, *_ in spans:
+        for k in range(s, e):
+            occupied[k] = True
+    for m in BARE_MATH_RE.finditer(text):
+        if any(occupied[k] for k in range(m.start(), m.end())):
+            continue
+        spans.append((m.start(), m.end(), m.group(0), False))
+    spans = _merge_spans(spans, text)
+    segs = []
+    pos = 0
+    for s, e, latex, disp in spans:
+        if s > pos:
+            segs.append(("text", text[pos:s], False))
+        segs.append(("math", latex, disp))
+        pos = e
+    if pos < len(text):
+        segs.append(("text", text[pos:], False))
+    return segs or [("text", text, False)]
+
+
+def append_omml(paragraph, latex: str, display: bool = False):
+    paragraph._p.append(latex_to_omml(latex, display=display))
+    if display:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
 
 class ImageIndex:
@@ -96,7 +383,7 @@ class ImageIndex:
         return None
 
 
-def set_run_font(run, size_pt, bold=False, italic=False, code=False):
+def set_run_font(run, size_pt, bold=False, italic=False, code=False, color=None):
     run.bold, run.italic, run.font.size = bold, italic, size_pt
     name = FONT_CODE if code else FONT_EN
     run.font.name = name
@@ -104,6 +391,8 @@ def set_run_font(run, size_pt, bold=False, italic=False, code=False):
     rFonts.set(qn("w:ascii"), name)
     rFonts.set(qn("w:hAnsi"), name)
     rFonts.set(qn("w:eastAsia"), FONT_CN)
+    if color is not None:
+        run.font.color.rgb = color
 
 
 def set_paragraph_format(p, space_after=Pt(6), first_line=False, left_indent=None, space_before=Pt(0)):
@@ -211,32 +500,38 @@ def add_formatted_runs(paragraph, text, size=SIZE_BODY, base_bold=False):
         if token.startswith("**"):
             run = paragraph.add_run(normalize_quotes(token[2:-2]))
             set_run_font(run, size, bold=True)
-        elif token.startswith("`"):
+        else:
             run = paragraph.add_run(token[1:-1])
             set_run_font(run, SIZE_CODE if size == SIZE_BODY else size, code=True)
-        else:
-            run = paragraph.add_run(token.replace("\\(", "").replace("\\)", ""))
-            set_run_font(run, size, italic=True)
         pos = m.end()
     if pos < len(text):
         run = paragraph.add_run(text[pos:])
         set_run_font(run, size, bold=base_bold)
 
 
+def add_text_with_math(paragraph, text, size=SIZE_BODY, base_bold=False):
+    """Render text, converting LaTeX fragments to Word OMML (§17)."""
+    for kind, payload, display in extract_math_segments(text):
+        if kind == "math":
+            append_omml(paragraph, payload, display=display)
+        elif payload:
+            add_formatted_runs(paragraph, payload, size, base_bold)
+
+
 def add_inline_runs(paragraph, text, size=SIZE_BODY, base_bold=False):
-    """Render markdown inline: **bold**, `code`, \\(math\\), [text](url) hyperlinks."""
+    """Render markdown inline: **bold**, `code`, LaTeX math, [text](url)."""
     text = normalize_quotes(text)
     pos = 0
     for m in LINK_RE.finditer(text):
         if m.start() > pos:
-            add_formatted_runs(paragraph, text[pos : m.start()], size, base_bold)
+            add_text_with_math(paragraph, text[pos : m.start()], size, base_bold)
         display, url = m.group(1), m.group(2)
         bold = base_bold or (display.startswith("**") and display.endswith("**"))
         display_clean = normalize_quotes(display.replace("**", "").replace("`", ""))
         add_hyperlink(paragraph, display_clean, url, size=size, bold=bold)
         pos = m.end()
     if pos < len(text):
-        add_formatted_runs(paragraph, text[pos:], size, base_bold)
+        add_text_with_math(paragraph, text[pos:], size, base_bold)
 
 
 def add_heading_styled(doc, text, level):
@@ -270,18 +565,22 @@ def add_list_item(doc, text, ordered=False, index=1):
 
 
 def add_code_block(doc, code_text):
-    for line in code_text.splitlines() or [""]:
+    """§18: fenced code → black paragraph shading, white Consolas."""
+    lines = code_text.splitlines() or [""]
+    for i, line in enumerate(lines):
         p = doc.add_paragraph()
         pf = p.paragraph_format
         pf.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
-        pf.space_before = pf.space_after = Pt(0)
+        pf.space_before = HALF_LINE if i == 0 else Pt(0)
+        pf.space_after = HALF_LINE if i == len(lines) - 1 else Pt(0)
         pf.left_indent = Cm(0.5)
+        pPr = p._p.get_or_add_pPr()
         shd = OxmlElement("w:shd")
-        shd.set(qn("w:fill"), "F5F5F5")
+        shd.set(qn("w:fill"), CODE_BG)
         shd.set(qn("w:val"), "clear")
-        p._p.get_or_add_pPr().append(shd)
+        pPr.append(shd)
         run = p.add_run(line if line else " ")
-        set_run_font(run, SIZE_CODE, code=True)
+        set_run_font(run, SIZE_CODE, code=True, color=CODE_FG)
     sp = doc.add_paragraph()
     set_paragraph_format(sp, space_after=Pt(6))
 
@@ -557,20 +856,20 @@ def parse_md(doc, md_text: str, images: ImageIndex):
             i += 1
             continue
 
-        if stripped.startswith("\\[") or stripped == "\\[":
+        if stripped.startswith("\\[") or stripped == "\\[" or stripped.startswith("$$"):
             buf = stripped
-            if "\\]" not in stripped:
+            closer = "$$" if stripped.startswith("$$") else "\\]"
+            if closer not in stripped or stripped.count(closer) < (2 if closer == "$$" else 1):
                 i += 1
-                while i < n and "\\]" not in lines[i]:
-                    buf += lines[i].strip()
+                while i < n and closer not in lines[i]:
+                    buf += " " + lines[i].strip()
                     i += 1
                 if i < n:
-                    buf += lines[i].strip()
+                    buf += " " + lines[i].strip()
+            latex = buf.replace("\\[", "").replace("\\]", "").replace("$$", "").strip()
             p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             set_paragraph_format(p, first_line=False)
-            run = p.add_run(buf.replace("\\[", "").replace("\\]", "").strip())
-            set_run_font(run, SIZE_BODY, italic=True)
+            append_omml(p, latex, display=True)
             i += 1
             continue
 

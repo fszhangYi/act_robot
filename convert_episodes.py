@@ -41,14 +41,17 @@ Usage:
         --output-dir /data/out \\
         --annotation-dir <dataset>/annotation \\
         --camera-names chest top wrist_2 \\
-        --action-space cartesian_abs --stride 1 --unwrap-rx
+        --action-space cartesian_abs --stride 1 --unwrap-rx \\
+        --num-workers 4
 """
 from __future__ import annotations
 
 import argparse
 import json
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
@@ -349,6 +352,145 @@ def convert_episode(
 
 
 # ---------------------------------------------------------------------------
+# Parallel worker
+# ---------------------------------------------------------------------------
+
+def _run_convert_task(task: dict[str, Any]) -> dict[str, Any]:
+    """ProcessPool entry point: convert one episode (or skip if already valid)."""
+    ep_dir = Path(task['ep_dir'])
+    out_path = Path(task['out_path'])
+    try:
+        if task['skip_existing']:
+            T_existing = _validate_existing_hdf5(out_path)
+            if T_existing is not None:
+                return {
+                    'status': 'skipped_existing',
+                    'global_idx': task['global_idx'],
+                    'group': task['group'],
+                    'ep_name': ep_dir.name,
+                    'T': T_existing,
+                }
+        T = convert_episode(
+            ep_dir, out_path, stride=task['stride'],
+            camera_names=task['camera_names'], action_space=task['action_space'],
+            start_idx=task['start_idx'], end_idx=task['end_idx'],
+            unwrap_rx=task['unwrap_rx'],
+        )
+        return {
+            'status': 'ok',
+            'global_idx': task['global_idx'],
+            'group': task['group'],
+            'ep_name': ep_dir.name,
+            'T': T,
+        }
+    except Exception as exc:
+        return {
+            'status': 'error',
+            'global_idx': task['global_idx'],
+            'group': task['group'],
+            'ep_name': ep_dir.name,
+            'error': str(exc),
+        }
+
+
+def _build_convert_tasks(
+    train_eps: list[Path],
+    val_eps: list[Path],
+    output_dir: Path,
+    annot_dir: Path | None,
+    skipped_no_annot: list[str],
+    *,
+    stride: int,
+    camera_names: list[str],
+    action_space: str,
+    unwrap_rx: bool,
+    skip_existing: bool,
+) -> list[dict[str, Any]]:
+    """Assign fixed episode_<idx>.hdf5 paths in train-then-val shuffle order."""
+    tasks: list[dict[str, Any]] = []
+    global_idx = 0
+    for group_eps, group_label in [(train_eps, 'train'), (val_eps, 'val')]:
+        for ep_dir in group_eps:
+            start_idx, end_idx = None, None
+            if annot_dir is not None:
+                parsed = _parse_annotation(annot_dir / f'{ep_dir.name}.txt')
+                if parsed is None:
+                    skipped_no_annot.append(ep_dir.name)
+                    continue
+                start_idx, end_idx = parsed
+            tasks.append({
+                'ep_dir': str(ep_dir),
+                'out_path': str(output_dir / f'episode_{global_idx}.hdf5'),
+                'global_idx': global_idx,
+                'group': group_label,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'stride': stride,
+                'camera_names': camera_names,
+                'action_space': action_space,
+                'unwrap_rx': unwrap_rx,
+                'skip_existing': skip_existing,
+            })
+            global_idx += 1
+    return tasks
+
+
+def _collect_task_results(
+    tasks: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+) -> tuple[list[int], list[int], list[int], list[str], list[str]]:
+    """Fold worker results into dataset_info fields (processing order)."""
+    by_idx = {r['global_idx']: r for r in results}
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    episode_lengths: list[int] = []
+    errors: list[str] = []
+    skipped_existing: list[str] = []
+
+    for task in tasks:
+        result = by_idx.get(task['global_idx'])
+        if result is None:
+            continue
+        if result['status'] == 'error':
+            errors.append(f"{result['ep_name']}: {result['error']}")
+            print(f"  SKIP {result['ep_name']}: {result['error']}")
+            continue
+        if result['status'] == 'skipped_existing':
+            skipped_existing.append(
+                f"{result['ep_name']} (idx={result['global_idx']})"
+            )
+        if task['group'] == 'train':
+            train_indices.append(task['global_idx'])
+        else:
+            val_indices.append(task['global_idx'])
+        episode_lengths.append(result['T'])
+
+    return train_indices, val_indices, episode_lengths, errors, skipped_existing
+
+
+def _run_tasks(
+    tasks: list[dict[str, Any]],
+    num_workers: int,
+) -> list[dict[str, Any]]:
+    """Convert all tasks sequentially (1 worker) or via ProcessPoolExecutor."""
+    if not tasks:
+        return []
+
+    if num_workers <= 1:
+        results: list[dict[str, Any]] = []
+        for task in tqdm(tasks, desc='Converting'):
+            results.append(_run_convert_task(task))
+        return results
+
+    results = []
+    with ProcessPoolExecutor(max_workers=num_workers) as pool:
+        futures = [pool.submit(_run_convert_task, task) for task in tasks]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc='Converting'):
+            results.append(fut.result())
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -378,7 +520,14 @@ def main() -> None:
                         help='Skip episodes whose output HDF5 already exists and is valid. '
                              'Useful for resuming an interrupted conversion run (same seed '
                              'guarantees the same train/val split and episode ordering).')
+    parser.add_argument('--num-workers', type=int, default=1,
+                        help='Parallel episode converters (default: 1 = sequential). '
+                             'Each worker loads/resizes/writes one episode at a time; '
+                             'use 4–8 on multi-core machines. Episodes share the container '
+                             'CPU quota, so more workers helps most when IO-bound.')
     args = parser.parse_args()
+    if args.num_workers < 1:
+        parser.error('--num-workers must be >= 1')
 
     random.seed(args.seed)
 
@@ -397,55 +546,26 @@ def main() -> None:
     val_eps = episode_dirs[n_train:]
     print(f'Episodes: {len(episode_dirs)} total  |  train={len(train_eps)}  val={len(val_eps)}  '
           f'stride={args.stride}  action_space={args.action_space}  '
-          f'annotation={"yes" if annot_dir else "no"}  unwrap_rx={args.unwrap_rx}')
+          f'annotation={"yes" if annot_dir else "no"}  unwrap_rx={args.unwrap_rx}  '
+          f'num_workers={args.num_workers}')
 
-    episode_lengths: list[int] = []
-    train_indices: list[int] = []
-    val_indices: list[int] = []
-    global_idx = 0
-    errors: list[str] = []
     skipped_no_annot: list[str] = []
+    tasks = _build_convert_tasks(
+        train_eps, val_eps, output_dir, annot_dir, skipped_no_annot,
+        stride=args.stride,
+        camera_names=args.camera_names,
+        action_space=args.action_space,
+        unwrap_rx=args.unwrap_rx,
+        skip_existing=args.skip_existing,
+    )
+    print(f'Tasks: {len(tasks)} episodes to convert '
+          f'(skipped {len(skipped_no_annot)} without valid annotation)')
 
-    skipped_existing: list[str] = []
-
-    for group_eps, group_label, indices_list in [
-        (train_eps, 'train', train_indices),
-        (val_eps,   'val',   val_indices),
-    ]:
-        for ep_dir in tqdm(group_eps, desc=f'Converting {group_label}'):
-            start_idx, end_idx = None, None
-            if annot_dir is not None:
-                parsed = _parse_annotation(annot_dir / f'{ep_dir.name}.txt')
-                if parsed is None:
-                    skipped_no_annot.append(ep_dir.name)
-                    continue
-                start_idx, end_idx = parsed
-
-            out_path = output_dir / f'episode_{global_idx}.hdf5'
-
-            # --- skip-existing: fast-path already-converted episodes ---
-            if args.skip_existing:
-                T_existing = _validate_existing_hdf5(out_path)
-                if T_existing is not None:
-                    indices_list.append(global_idx)
-                    episode_lengths.append(T_existing)
-                    global_idx += 1
-                    skipped_existing.append(f'{ep_dir.name} (idx={global_idx - 1})')
-                    continue
-
-            # --- normal conversion ---
-            try:
-                T = convert_episode(
-                    ep_dir, out_path, stride=args.stride,
-                    camera_names=args.camera_names, action_space=args.action_space,
-                    start_idx=start_idx, end_idx=end_idx, unwrap_rx=args.unwrap_rx,
-                )
-                indices_list.append(global_idx)
-                episode_lengths.append(T)
-                global_idx += 1
-            except Exception as exc:
-                errors.append(f'{ep_dir.name}: {exc}')
-                print(f'  SKIP {ep_dir.name}: {exc}')
+    results = _run_tasks(tasks, args.num_workers)
+    train_indices, val_indices, episode_lengths, errors, skipped_existing = (
+        _collect_task_results(tasks, results)
+    )
+    global_idx = len(episode_lengths)
 
     if skipped_no_annot:
         print(f'\n{len(skipped_no_annot)} episodes skipped (no valid annotation):')
@@ -473,6 +593,7 @@ def main() -> None:
         'max_episode_len': int(max(episode_lengths)) if episode_lengths else 0,
         'action_space': args.action_space,
         'camera_names': args.camera_names,
+        'num_workers': args.num_workers,
         'rx_unwrapped': bool(args.unwrap_rx and args.action_space in ('cartesian_abs', 'cartesian')),
     }
     with (output_dir / 'dataset_info.json').open('w') as f:
