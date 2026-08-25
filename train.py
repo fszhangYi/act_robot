@@ -202,6 +202,7 @@ def train(
     val_history: list[dict] = []
     min_val_loss = float('inf')
     best_state_dict = None
+    saved_scheduler_state = None
 
     if resume_from is not None:
         resume_dir = str(Path(resume_from).parent)
@@ -216,6 +217,7 @@ def train(
             try:
                 optimizer.load_state_dict(opt_ckpt['optimizer_state_dict'])
                 start_epoch = int(opt_ckpt.get('epoch', 0))
+                saved_scheduler_state = opt_ckpt.get('scheduler_state_dict')
                 saved_lr = optimizer.param_groups[0]['lr']
                 print(f'Optimizer state loaded.  Saved LR={saved_lr}  '
                       f'resuming from epoch {start_epoch + 1}')
@@ -267,10 +269,19 @@ def train(
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=num_epochs, eta_min=min_lr,
         )
-        # Fast-forward the scheduler to match start_epoch
-        for _ in range(start_epoch):
-            scheduler.step()
-        if start_epoch > 0:
+        if saved_scheduler_state is not None:
+            try:
+                scheduler.load_state_dict(saved_scheduler_state)
+                print(f'CosineAnnealingLR state restored '
+                      f'(epoch {start_epoch + 1}, LR={scheduler.get_last_lr()[0]:.2e})')
+            except Exception as e:
+                print(f'WARNING: Failed to load scheduler state: {e}')
+                print('Fast-forwarding scheduler from scratch.')
+                for _ in range(start_epoch):
+                    scheduler.step()
+        elif start_epoch > 0:
+            for _ in range(start_epoch):
+                scheduler.step()
             print(f'CosineAnnealingLR advanced to epoch {start_epoch} '
                   f'(T_max={num_epochs}, current LR={scheduler.get_last_lr()[0]:.2e})')
 
@@ -375,6 +386,7 @@ def train(
                 encoder_tokens_since_log = 0
                 decoder_tokens_since_log = 0
                 cvae_tokens_since_log = 0
+                samples_since_log = 0
                 loss_since_log = 0.0
                 n_batches_since_log = 0
                 batch_start_time = time.perf_counter()
@@ -475,6 +487,9 @@ def main() -> None:
     parser.add_argument('--nheads', type=int, default=8)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--hdf5-cache-size', type=int, default=16,
+                        help='Max open HDF5 files per DataLoader worker (LRU). '
+                             'Lower = less RAM, more open/close I/O. 0 = no cache.')
     parser.add_argument('--camera-names', nargs='+', default=['wrist'],
                         choices=['wrist', 'rear_left', 'chest', 'top', 'wrist_2'],
                         help='Cameras to use for training (default: wrist). Must match what '
@@ -548,6 +563,7 @@ def main() -> None:
     max_episode_len = info['max_episode_len']
     print(f'Dataset: {info["num_total"]} episodes  |  train={len(train_indices)}  val={len(val_indices)}')
     print(f'max_episode_len={max_episode_len}  stride={info.get("stride", 1)}')
+    print(f'hdf5_cache_size={args.hdf5_cache_size} per DataLoader worker')
 
 
     # Normalization stats from training set only
@@ -567,15 +583,19 @@ def main() -> None:
     if args.use_sam2_features:
         train_dataset = SAM2EpisodicDataset(train_indices, data_dir, norm_stats,
                                             max_episode_len, action_repr=args.action_repr,
-                                            chunk_size=args.chunk_size)
+                                            chunk_size=args.chunk_size,
+                                            hdf5_cache_size=args.hdf5_cache_size)
         val_dataset = SAM2EpisodicDataset(val_indices, data_dir, norm_stats,
                                           max_episode_len, action_repr=args.action_repr,
-                                          chunk_size=args.chunk_size)
+                                          chunk_size=args.chunk_size,
+                                          hdf5_cache_size=args.hdf5_cache_size)
     else:
         train_dataset = EpisodicDataset(train_indices, data_dir, camera_names, norm_stats,
-                                        max_episode_len, chunk_size=args.chunk_size)
+                                        max_episode_len, chunk_size=args.chunk_size,
+                                        hdf5_cache_size=args.hdf5_cache_size)
         val_dataset = EpisodicDataset(val_indices, data_dir, camera_names, norm_stats,
-                                      max_episode_len, chunk_size=args.chunk_size)
+                                      max_episode_len, chunk_size=args.chunk_size,
+                                      hdf5_cache_size=args.hdf5_cache_size)
 
     loader_gen = torch.Generator()
     loader_gen.manual_seed(args.seed)
@@ -643,7 +663,9 @@ def main() -> None:
         json.dump({**policy_config, 'chunk_size': args.chunk_size,
                    'num_epochs': args.num_epochs, 'batch_size': args.batch_size,
                    'seed': args.seed, 'action_space': args.action_space,
-                   'use_sam2_features': args.use_sam2_features}, f, indent=2)
+                   'use_sam2_features': args.use_sam2_features,
+                   'hdf5_cache_size': args.hdf5_cache_size,
+                   'num_workers': args.num_workers}, f, indent=2)
 
     policy.cuda()
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
+from contextlib import contextmanager
 
 import h5py
 import numpy as np
@@ -10,32 +12,55 @@ from torch.utils.data import Dataset
 
 
 class _Hdf5CacheMixin:
-    """在当前进程内缓存已打开的 HDF5，避免每个 __getitem__ 反复 open/close。
+    """LRU cache for open HDF5 handles (per DataLoader worker process).
 
-    DataLoader 多 worker 时每个 worker 进程各自持有一份缓存；配合
-    persistent_workers=True 可跨 epoch 复用句柄。
+    Without a bound, ``persistent_workers=True`` + shuffle over hundreds of
+    episodes causes each worker to accumulate every file it has ever touched.
     """
 
-    def _init_hdf5_cache(self) -> None:
-        self._hdf5_cache: dict[str, h5py.File] = {}
+    def _init_hdf5_cache(self, max_open: int = 16) -> None:
+        self._hdf5_cache_max = max(0, int(max_open))
+        self._hdf5_cache: OrderedDict[str, h5py.File] = OrderedDict()
+
+    @contextmanager
+    def _hdf5_root(self, path: str):
+        if self._hdf5_cache_max <= 0:
+            with h5py.File(path, 'r') as root:
+                yield root
+            return
+        root = self._open_hdf5(path)
+        try:
+            yield root
+        except Exception:
+            raise
 
     def _open_hdf5(self, path: str) -> h5py.File:
-        f = self._hdf5_cache.get(path)
-        if f is None:
-            f = h5py.File(path, 'r')
-            self._hdf5_cache[path] = f
-        return f
-
-    def __del__(self) -> None:
-        cache = getattr(self, '_hdf5_cache', None)
-        if not cache:
-            return
-        for f in cache.values():
+        cache = self._hdf5_cache
+        cached = cache.get(path)
+        if cached is not None:
+            cache.move_to_end(path)
+            return cached
+        handle = h5py.File(path, 'r')
+        cache[path] = handle
+        while len(cache) > self._hdf5_cache_max:
+            _, evicted = cache.popitem(last=False)
             try:
-                f.close()
+                evicted.close()
             except Exception:
                 pass
-        cache.clear()
+        return handle
+
+    def _close_hdf5_cache(self) -> None:
+        for handle in self._hdf5_cache.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._hdf5_cache.clear()
+
+    def __del__(self) -> None:
+        if getattr(self, '_hdf5_cache', None):
+            self._close_hdf5_cache()
 
 
 class EpisodicDataset(_Hdf5CacheMixin, Dataset):
@@ -52,7 +77,7 @@ class EpisodicDataset(_Hdf5CacheMixin, Dataset):
     """
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats,
-                 max_episode_len, chunk_size: int = 10):
+                 max_episode_len, chunk_size: int = 10, hdf5_cache_size: int = 16):
         super().__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -61,7 +86,7 @@ class EpisodicDataset(_Hdf5CacheMixin, Dataset):
         self.max_episode_len = max_episode_len  # 保留供调试 / 兼容
         self.chunk_size = int(chunk_size)
         self.is_sim = True
-        self._init_hdf5_cache()
+        self._init_hdf5_cache(hdf5_cache_size)
 
     def __len__(self):
         return len(self.episode_ids)
@@ -69,19 +94,19 @@ class EpisodicDataset(_Hdf5CacheMixin, Dataset):
     def __getitem__(self, index):
         episode_id = self.episode_ids[index]
         dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
-        root = self._open_hdf5(dataset_path)
-        original_action_shape = root['/action'].shape
-        episode_len = original_action_shape[0]
-        start_ts = np.random.choice(episode_len)
+        with self._hdf5_root(dataset_path) as root:
+            original_action_shape = root['/action'].shape
+            episode_len = original_action_shape[0]
+            start_ts = np.random.choice(episode_len)
 
-        qpos = root['/observations/qpos'][start_ts]
-        image_dict = {
-            cam: root[f'/observations/images/{cam}'][start_ts]
-            for cam in self.camera_names
-        }
-        end_ts = min(start_ts + self.chunk_size, episode_len)
-        action = root['/action'][start_ts:end_ts]
-        action_len = end_ts - start_ts
+            qpos = root['/observations/qpos'][start_ts]
+            image_dict = {
+                cam: root[f'/observations/images/{cam}'][start_ts]
+                for cam in self.camera_names
+            }
+            end_ts = min(start_ts + self.chunk_size, episode_len)
+            action = root['/action'][start_ts:end_ts]
+            action_len = end_ts - start_ts
 
         padded_action = np.zeros((self.chunk_size, original_action_shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
@@ -124,7 +149,8 @@ class SAM2EpisodicDataset(_Hdf5CacheMixin, Dataset):
     """
 
     def __init__(self, episode_ids, dataset_dir, norm_stats, max_episode_len,
-                 action_repr: str = 'absolute', chunk_size: int = 10):
+                 action_repr: str = 'absolute', chunk_size: int = 10,
+                 hdf5_cache_size: int = 16):
         super().__init__()
         assert action_repr in ('absolute', 'delta')
         self.episode_ids = episode_ids
@@ -133,7 +159,7 @@ class SAM2EpisodicDataset(_Hdf5CacheMixin, Dataset):
         self.max_episode_len = max_episode_len
         self.action_repr = action_repr
         self.chunk_size = int(chunk_size)
-        self._init_hdf5_cache()
+        self._init_hdf5_cache(hdf5_cache_size)
 
     def __len__(self):
         return len(self.episode_ids)
@@ -141,25 +167,25 @@ class SAM2EpisodicDataset(_Hdf5CacheMixin, Dataset):
     def __getitem__(self, index):
         episode_id = self.episode_ids[index]
         path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
-        root = self._open_hdf5(path)
-        T, action_dim = root['/action'].shape
-        start_ts = np.random.choice(T)
+        with self._hdf5_root(path) as root:
+            T, action_dim = root['/action'].shape
+            start_ts = np.random.choice(T)
 
-        qpos = root['/observations/qpos'][start_ts]
-        sam2_feat = root['/observations/sam2_feat'][start_ts]  # [256, 64, 64]
-        end_ts = min(start_ts + self.chunk_size, T)
-        action = root['/action'][start_ts:end_ts]
-        action_len = end_ts - start_ts
+            qpos = root['/observations/qpos'][start_ts]
+            sam2_feat = root['/observations/sam2_feat'][start_ts]  # [256, 64, 64]
+            end_ts = min(start_ts + self.chunk_size, T)
+            action = root['/action'][start_ts:end_ts]
+            action_len = end_ts - start_ts
 
-        if self.action_repr == 'delta':
-            # target_k = action[start_ts + k] - qpos[start_ts]  for k in [0, action_len)
-            target = action.astype(np.float32) - qpos.astype(np.float32)[None, :]
-            target_mean = self.norm_stats['delta_mean']
-            target_std = self.norm_stats['delta_std']
-        else:
-            target = action.astype(np.float32)
-            target_mean = self.norm_stats['action_mean']
-            target_std = self.norm_stats['action_std']
+            if self.action_repr == 'delta':
+                # target_k = action[start_ts + k] - qpos[start_ts]  for k in [0, action_len)
+                target = action.astype(np.float32) - qpos.astype(np.float32)[None, :]
+                target_mean = self.norm_stats['delta_mean']
+                target_std = self.norm_stats['delta_std']
+            else:
+                target = action.astype(np.float32)
+                target_mean = self.norm_stats['action_mean']
+                target_std = self.norm_stats['action_std']
 
         padded_target = np.zeros((self.chunk_size, action_dim), dtype=np.float32)
         padded_target[:action_len] = target

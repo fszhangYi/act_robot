@@ -16,6 +16,9 @@ checkpoints/*.pth
 # Inference / session logs
 logs/
 
+# Jupyter
+.ipynb_checkpoints/
+
 # Editor
 .vscode/
 .idea/
